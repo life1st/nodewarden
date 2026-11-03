@@ -3,6 +3,7 @@ import { useLocation } from 'wouter';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import AppAuthenticatedShell from '@/components/AppAuthenticatedShell';
 import AppGlobalOverlays, { type AppConfirmState } from '@/components/AppGlobalOverlays';
+import { MIN_MASTER_PASSWORD_LENGTH } from '@shared/auth-limits';
 import AuthRequestApprovalDialog from '@/components/AuthRequestApprovalDialog';
 import AuthViews from '@/components/AuthViews';
 import NotFoundPage from '@/components/NotFoundPage';
@@ -779,8 +780,8 @@ export default function App() {
       pushToast('error', t('txt_please_input_email_and_password'));
       return;
     }
-    if (registerValues.password.length < 12) {
-      pushToast('error', t('txt_master_password_must_be_at_least_12_chars'));
+    if (registerValues.password.length < MIN_MASTER_PASSWORD_LENGTH) {
+      pushToast('error', t('txt_master_password_must_be_at_least_chars', { min: MIN_MASTER_PASSWORD_LENGTH }));
       return;
     }
     if (registerValues.password !== registerValues.password2) {

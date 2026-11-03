@@ -1,5 +1,10 @@
-﻿export const LIMITS = {
+﻿import { MIN_MASTER_PASSWORD_LENGTH } from '../../shared/auth-limits';
+
+export const LIMITS = {
   auth: {
+    // Minimum master password length for account creation and validation.
+    // 主密码最小长度（用于账户创建与校验）。
+    masterPasswordMinLength: MIN_MASTER_PASSWORD_LENGTH,
     // Access token lifetime in seconds.
     // 访问令牌有效期（秒）。
     accessTokenTtlSeconds: 7200,
