@@ -13,6 +13,7 @@ import {
 } from 'lucide-preact';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { t } from '@/lib/i18n';
+import type { MutationKind, MutationPhase } from '@/lib/api/write-queue';
 import type { Cipher, CipherAttachment, CustomFieldType, Folder, VaultDraft, VaultDraftField, VaultDraftLoginUri } from '@/lib/types';
 import { firstCipherUri, hostFromUri, websiteIconUrl } from '@/lib/website-utils';
 import { normalizeEquivalentDomain } from '@shared/domain-normalize';
@@ -312,6 +313,23 @@ export function cipherTypeLabel(type: number): string {
   if (type === 7) return t('txt_drivers_license');
   if (type === 8) return t('txt_passport');
   return t('txt_item');
+}
+
+/**
+ * D1-103: write status lives inside the action button instead of a separate
+ * tip line (确认 -> 保存中..., 是 -> 删除中...). Returns `fallback` when no
+ * mutation of that kind is pending.
+ */
+export function mutationActionLabel(
+  kind: MutationKind,
+  phase: MutationPhase | null | undefined,
+  fallback: string
+): string {
+  if (!phase) return fallback;
+  if (phase === 'queued') return t('txt_queued');
+  if (kind === 'save') return t('txt_saving');
+  if (kind === 'delete') return t('txt_deleting');
+  return t('txt_processing');
 }
 
 export function TypeIcon({ type }: { type: number }) {

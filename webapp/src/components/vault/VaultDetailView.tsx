@@ -6,6 +6,7 @@ import type { TotpCodeResult } from '@/lib/crypto';
 import { checkPasswordLeaked, type PasswordBreachResult } from '@/lib/password-security';
 import type { Cipher } from '@/lib/types';
 import { t } from '@/lib/i18n';
+import type { MutationKind, MutationPhase } from '@/lib/api/write-queue';
 import {
   CardBrandIcon,
   TOTP_RING_CIRCUMFERENCE,
@@ -17,6 +18,7 @@ import {
   formatTotp,
   isCipherDeleted,
   maskSecret,
+  mutationActionLabel,
   openUri,
   parseFieldType,
   toBooleanFieldValue,
@@ -30,9 +32,12 @@ interface VaultDetailViewProps {
   selectedCipher: Cipher;
   /** Cipher id of the write that is currently queued or running, if any. */
   pendingCipherId?: string;
-  /** Cipher id whose last write failed and can be retried. */
+  /** Kind/phase of that write, used to swap the button label (处理中...). */
+  pendingKind?: MutationKind;
+  pendingPhase?: MutationPhase;
+  /** Cipher id whose last write failed; the button becomes a retry action. */
   failedCipherId?: string;
-  onRetry?: () => void;
+  failedKind?: MutationKind;
   repromptApprovedCipherId: string | null;
   showPassword: boolean;
   totpLive: TotpCodeResult | null;
@@ -107,6 +112,15 @@ export default function VaultDetailView(props: VaultDetailViewProps) {
   const isDeleted = isCipherDeleted(props.selectedCipher);
   const cipherPending = !!props.pendingCipherId && props.pendingCipherId === props.selectedCipher.id;
   const cipherFailed = !cipherPending && !!props.failedCipherId && props.failedCipherId === props.selectedCipher.id;
+  // D1-103: the pending/failed state lives on the action button itself
+  // (处理中... / 重试) instead of a separate tip line above the actions.
+  const actionLabel = (kind: MutationKind, fallback: string): string => {
+    if (cipherPending && props.pendingKind === kind) {
+      return mutationActionLabel(kind, props.pendingPhase, fallback);
+    }
+    if (cipherFailed && props.failedKind === kind) return t('txt_retry');
+    return fallback;
+  };
   const passwordHistoryEntries = useMemo(
     () =>
       (props.selectedCipher.passwordHistory || [])
@@ -555,21 +569,11 @@ export default function VaultDetailView(props: VaultDetailViewProps) {
             </div>
           )}
 
-          {(cipherPending || cipherFailed) && (
-            <div className={`mutation-status ${cipherPending ? 'mutation-status-pending' : 'mutation-status-error'}`}>
-              <span>{cipherPending ? t('txt_processing') : t('txt_write_failed_retry')}</span>
-              {cipherFailed && props.onRetry && (
-                <button type="button" className="btn btn-secondary small" onClick={props.onRetry}>
-                  {t('txt_retry')}
-                </button>
-              )}
-            </div>
-          )}
           <div className="detail-actions">
             <div className="actions">
               {isDeleted ? (
                 <button type="button" className="btn btn-secondary" disabled={cipherPending} onClick={() => void props.onRestore(props.selectedCipher)}>
-                  <RotateCcw size={14} className="btn-icon" /> {t('txt_restore')}
+                  <RotateCcw size={14} className="btn-icon" /> {actionLabel('restore', t('txt_restore'))}
                 </button>
               ) : (
                 <>
@@ -578,18 +582,18 @@ export default function VaultDetailView(props: VaultDetailViewProps) {
                   </button>
                   {isArchived ? (
                     <button type="button" className="btn btn-secondary" disabled={cipherPending} onClick={() => void props.onUnarchive(props.selectedCipher)}>
-                      <RotateCcw size={14} className="btn-icon" /> {t('txt_unarchive')}
+                      <RotateCcw size={14} className="btn-icon" /> {actionLabel('unarchive', t('txt_unarchive'))}
                     </button>
                   ) : (
                     <button type="button" className="btn btn-secondary" disabled={cipherPending} onClick={() => void props.onArchive(props.selectedCipher)}>
-                      <Archive size={14} className="btn-icon" /> {t('txt_archive')}
+                      <Archive size={14} className="btn-icon" /> {actionLabel('archive', t('txt_archive'))}
                     </button>
                   )}
                 </>
               )}
             </div>
             <button type="button" className="btn btn-danger" disabled={cipherPending} onClick={() => props.onDelete(props.selectedCipher)}>
-              <Trash2 size={14} className="btn-icon" /> {isDeleted ? t('txt_delete_permanently') : t('txt_delete')}
+              <Trash2 size={14} className="btn-icon" /> {actionLabel('delete', isDeleted ? t('txt_delete_permanently') : t('txt_delete'))}
             </button>
           </div>
         </>

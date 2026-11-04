@@ -1,11 +1,17 @@
+import { useMemo } from 'preact/hooks';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import SearchableSelect from '@/components/SearchableSelect';
 import type { CustomFieldType, Folder } from '@/lib/types';
-import { folderDisplayName, getFieldTypeOptions, toBooleanFieldValue } from '@/components/vault/vault-page-helpers';
+import { folderDisplayName, getFieldTypeOptions, mutationActionLabel, sortFolders, toBooleanFieldValue, type VaultSortMode } from '@/components/vault/vault-page-helpers';
+import type { MutationKind, MutationPhase } from '@/lib/api/write-queue';
 import { t } from '@/lib/i18n';
 
 interface VaultDialogsProps {
   busy: boolean;
+  /** Phase of the pending write of `kind`, so confirm buttons can show
+   * 处理中... / 删除中... instead of their idle label while it runs. */
+  mutationPhaseFor: (kind: MutationKind) => MutationPhase | null;
+  repromptVerifying: boolean;
   fieldModalOpen: boolean;
   fieldType: CustomFieldType;
   fieldLabel: string;
@@ -19,6 +25,7 @@ interface VaultDialogsProps {
   moveOpen: boolean;
   moveFolderId: string;
   folders: Folder[];
+  folderSortMode: VaultSortMode;
   createFolderOpen: boolean;
   newFolderName: string;
   renameFolderOpen: boolean;
@@ -63,6 +70,17 @@ interface VaultDialogsProps {
 
 export default function VaultDialogs(props: VaultDialogsProps) {
   const fieldTypeOptions = getFieldTypeOptions();
+  // D1-103: while this dialog's own operation is queued/running, the confirm
+  // button carries the status (是 -> 删除中...) instead of a separate tip.
+  const confirmLabel = (kind: MutationKind, fallback: string): string =>
+    mutationActionLabel(kind, props.mutationPhaseFor(kind), fallback);
+  const moveFolderOptions = useMemo(
+    () => sortFolders(props.folders, props.folderSortMode).map((folder) => ({
+      value: folder.id,
+      label: folderDisplayName(folder),
+    })),
+    [props.folders, props.folderSortMode]
+  );
   return (
     <>
       <ConfirmDialog
@@ -113,7 +131,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         open={props.archiveConfirmOpen}
         title={t('txt_archive_item')}
         message={t('txt_archive_item_message')}
-        confirmText={t('txt_archive')}
+        confirmText={confirmLabel('archive', t('txt_archive'))}
         cancelText={t('txt_cancel')}
         confirmDisabled={props.busy}
         cancelDisabled={props.busy}
@@ -125,7 +143,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         open={props.bulkArchiveOpen}
         title={t('txt_archive_selected_items')}
         message={t('txt_archive_selected_items_message', { count: props.selectedCount })}
-        confirmText={t('txt_archive')}
+        confirmText={confirmLabel('archive', t('txt_archive'))}
         cancelText={t('txt_cancel')}
         confirmDisabled={props.busy}
         cancelDisabled={props.busy}
@@ -140,6 +158,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         danger
         confirmDisabled={props.busy}
         cancelDisabled={props.busy}
+        confirmText={confirmLabel('delete', t('txt_yes'))}
         onConfirm={props.onConfirmDelete}
         onCancel={props.onCancelDelete}
       />
@@ -155,6 +174,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         danger
         confirmDisabled={props.busy}
         cancelDisabled={props.busy}
+        confirmText={confirmLabel('delete', t('txt_delete'))}
         onConfirm={props.onConfirmBulkDelete}
         onCancel={props.onCancelBulkDelete}
       />
@@ -163,7 +183,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         open={props.moveOpen}
         title={t('txt_move_selected_items')}
         message={t('txt_choose_destination_folder')}
-        confirmText={t('txt_move')}
+        confirmText={confirmLabel('move', t('txt_move'))}
         cancelText={t('txt_cancel')}
         confirmDisabled={props.busy}
         cancelDisabled={props.busy}
@@ -176,10 +196,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
             value={props.moveFolderId}
             options={[
               { value: '__none__', label: t('txt_no_folder'), pinned: true },
-              ...props.folders.map((folder) => ({
-                value: folder.id,
-                label: folderDisplayName(folder),
-              })),
+              ...moveFolderOptions,
             ]}
             onChange={props.onMoveFolderIdChange}
             placeholder={t('txt_select')}
@@ -192,7 +209,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         open={props.createFolderOpen}
         title={t('txt_create_folder')}
         message={t('txt_enter_a_folder_name')}
-        confirmText={t('txt_create')}
+        confirmText={confirmLabel('folder', t('txt_create'))}
         cancelText={t('txt_cancel')}
         confirmDisabled={props.busy}
         cancelDisabled={props.busy}
@@ -209,7 +226,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         open={props.renameFolderOpen}
         title={t('txt_edit')}
         message={t('txt_enter_a_folder_name')}
-        confirmText={t('txt_save')}
+        confirmText={confirmLabel('folder', t('txt_save'))}
         cancelText={t('txt_cancel')}
         confirmDisabled={props.busy}
         cancelDisabled={props.busy}
@@ -226,7 +243,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         open={!!props.pendingDeleteFolder}
         title={t('txt_delete_folder')}
         message={t('txt_delete_folder_message', { name: props.pendingDeleteFolder?.decName || props.pendingDeleteFolder?.name || props.pendingDeleteFolder?.id || '' })}
-        confirmText={t('txt_delete')}
+        confirmText={confirmLabel('folder', t('txt_delete'))}
         cancelText={t('txt_cancel')}
         danger
         confirmDisabled={props.busy}
@@ -239,7 +256,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         open={props.deleteAllFoldersOpen}
         title={t('txt_delete_all_folders')}
         message={t('txt_delete_all_folders_message')}
-        confirmText={t('txt_delete')}
+        confirmText={confirmLabel('folder', t('txt_delete'))}
         cancelText={t('txt_cancel')}
         danger
         confirmDisabled={props.busy}
@@ -252,7 +269,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         open={props.repromptOpen}
         title={t('txt_unlock_item')}
         message={t('txt_enter_master_password_to_view_this_item')}
-        confirmText={t('txt_unlock')}
+        confirmText={props.repromptVerifying ? t('txt_processing') : t('txt_unlock')}
         cancelText={t('txt_cancel')}
         showIcon={false}
         confirmDisabled={props.busy}

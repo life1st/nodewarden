@@ -501,6 +501,17 @@ export default function VaultEditor(props: VaultEditorProps) {
     props.onReorderDraftLoginUri(fromIndex, toIndex);
   };
 
+  // D1-103: write status is rendered on the confirm button itself instead of
+  // a separate tip line (确认 -> 排队中... / 保存中... / 重试).
+  const saveButtonLabel =
+    props.saveStatus === 'running'
+      ? t('txt_saving')
+      : props.saveStatus === 'queued'
+        ? t('txt_queued')
+        : props.saveStatus === 'error'
+          ? t('txt_retry')
+          : t('txt_confirm');
+
   return (
     <>
       <div className="card">
@@ -967,20 +978,11 @@ export default function VaultEditor(props: VaultEditorProps) {
           ))}
       </div>
 
-      {props.saveStatus && (
-        <div className={`mutation-status mutation-status-${props.saveStatus}`}>
-          {props.saveStatus === 'queued'
-            ? t('txt_write_queued')
-            : props.saveStatus === 'running'
-              ? t('txt_saving')
-              : t('txt_write_failed_retry')}
-        </div>
-      )}
       <div className="detail-actions">
         <div className="actions">
           <button type="button" className="btn btn-primary" disabled={props.busy} onClick={props.onSave}>
             <CheckCheck size={14} className="btn-icon" />
-            {t('txt_confirm')}
+            {saveButtonLabel}
           </button>
           <button type="button" className="btn btn-secondary" disabled={props.busy} onClick={props.onCancel}>
             <X size={14} className="btn-icon" />

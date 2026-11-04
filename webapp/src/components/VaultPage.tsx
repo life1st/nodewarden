@@ -34,7 +34,7 @@ import {
 import { calcTotpNow, type TotpCodeResult } from '@/lib/crypto';
 import { computeSshFingerprint, generateDefaultSshKeyMaterial } from '@/lib/ssh';
 import { buildLoginUsernameIndex } from '@/lib/username-autocomplete';
-import { NEW_CIPHER_WRITE_TARGET, VAULT_WRITE_KEY, type MutationKind, type MutationState } from '@/lib/api/write-queue';
+import { NEW_CIPHER_WRITE_TARGET, VAULT_WRITE_KEY, type MutationKind, type MutationPhase, type MutationState } from '@/lib/api/write-queue';
 import useWriteQueueState from '@/hooks/useWriteQueueState';
 import { ChevronLeft } from 'lucide-preact';
 import type { Cipher, CustomFieldType, Folder, VaultDraft, VaultDraftField } from '@/lib/types';
@@ -640,9 +640,16 @@ export default function VaultPage(props: VaultPageProps) {
   const isSavingCurrentDraft = activeMutations.some((mutation) => mutation.kind === 'save' && mutation.cipherId === draftTargetId);
   const draftSaveRunning =
     !!writeState.current && writeState.current.kind === 'save' && writeState.current.cipherId === draftTargetId;
-  // Only report the pending id that belongs to the selected item, so other
-  // items' action buttons stay usable while something else is being written.
-  const pendingCipherId = activeMutations.find((mutation) => mutation.cipherId === selectedCipherId)?.cipherId;
+  // Only report the pending mutation that belongs to the selected item, so
+  // other items' action buttons stay usable while something else is written.
+  const selectedPending = activeMutations.find((mutation) => mutation.cipherId === selectedCipherId) || null;
+  const pendingCipherId = selectedPending?.cipherId;
+  const pendingKind = selectedPending?.kind;
+  const pendingPhase = selectedPending?.phase;
+  // Phase of the pending write of a given kind, used by dialogs and the bulk
+  // toolbar to swap the button label (是 -> 删除中...) instead of showing a tip.
+  const mutationPhaseFor = (kind: MutationKind): MutationPhase | null =>
+    activeMutations.find((mutation) => mutation.kind === kind)?.phase ?? null;
   const saveStatus: 'queued' | 'running' | 'error' | null = isSavingCurrentDraft
     ? draftSaveRunning
       ? 'running'
@@ -1145,14 +1152,6 @@ const folderName = useCallback((id: string | null | undefined): string => {
     }
   }
 
-  function retryFailedMutation(): void {
-    if (!failedMutation) return;
-    const cipher = cipherById.get(failedMutation.cipherId);
-    if (!cipher) return;
-    if (failedMutation.kind === 'restore') void handleRestoreSelected(cipher);
-    else if (failedMutation.kind === 'unarchive') void handleUnarchiveSelected(cipher);
-  }
-
   const handleClearSearch = useCallback(() => setSearchInput(''), []);
   const handleSearchCompositionStart = useCallback(() => setSearchComposing(true), []);
   const handleSearchCompositionEnd = useCallback((value: string) => {
@@ -1281,6 +1280,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
         <VaultListPanel
           busy={hasPendingMutation}
           syncing={syncing}
+          mutationPhaseFor={mutationPhaseFor}
           loading={props.loading}
           error={props.error}
           folders={props.folders}
@@ -1392,8 +1392,10 @@ const folderName = useCallback((id: string | null | undefined): string => {
               <VaultDetailView
                 selectedCipher={selectedCipher}
                 pendingCipherId={pendingCipherId}
+                pendingKind={pendingKind}
+                pendingPhase={pendingPhase}
                 failedCipherId={failedMutation && failedMutation.kind !== 'save' ? failedMutation.cipherId : undefined}
-                onRetry={retryFailedMutation}
+                failedKind={failedMutation?.kind}
                 repromptApprovedCipherId={repromptApprovedCipherId}
                 showPassword={showPassword}
                 totpLive={totpLive}
@@ -1434,6 +1436,8 @@ const folderName = useCallback((id: string | null | undefined): string => {
 
       <VaultDialogs
         busy={hasPendingMutation || repromptVerifying}
+        mutationPhaseFor={mutationPhaseFor}
+        repromptVerifying={repromptVerifying}
         fieldModalOpen={fieldModalOpen}
         fieldType={fieldType}
         fieldLabel={fieldLabel}
@@ -1447,6 +1451,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
         moveOpen={moveOpen}
         moveFolderId={moveFolderId}
         folders={props.folders}
+        folderSortMode={folderSortMode}
         createFolderOpen={createFolderOpen}
         newFolderName={newFolderName}
         renameFolderOpen={!!pendingRenameFolder}

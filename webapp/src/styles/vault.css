@@ -1280,18 +1280,3 @@ select.input.duplicate-mode-toolbar-select {
   display: inline;
   vertical-align: middle;
 }
-
-/* D1-103: operation-level status text (queued / running / error). */
-.mutation-status {
-  @apply mb-2 flex items-center gap-2 text-sm font-semibold;
-  color: var(--muted-strong);
-}
-
-.mutation-status-queued,
-.mutation-status-pending {
-  color: var(--warning);
-}
-
-.mutation-status-error {
-  color: var(--danger);
-}

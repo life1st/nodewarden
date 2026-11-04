@@ -28,11 +28,13 @@ import {
 import LoadingState from '@/components/LoadingState';
 import type { Cipher, Folder } from '@/lib/types';
 import { t } from '@/lib/i18n';
+import type { MutationKind, MutationPhase } from '@/lib/api/write-queue';
 import {
   CreateTypeIcon,
   getCreateTypeOptions,
   getDuplicateDetectionOptions,
   getVaultSortOptions,
+  mutationActionLabel,
   VaultListIcon,
   type DuplicateDetectionMode,
   type SidebarFilter,
@@ -49,6 +51,9 @@ interface VirtualRange {
 interface VaultListPanelProps {
   busy: boolean;
   syncing: boolean;
+  /** Phase of the pending write of `kind`, so immediate bulk buttons can show
+   * their status (恢复 -> 处理中...) instead of a separate tip. */
+  mutationPhaseFor: (kind: MutationKind) => MutationPhase | null;
   loading: boolean;
   error: string;
   folders: Folder[];
@@ -297,12 +302,12 @@ export default function VaultListPanel(props: VaultListPanelProps) {
               </button>
               {props.sidebarFilter.kind === 'trash' && (
                 <button type="button" className="btn btn-secondary small" disabled={props.busy || props.syncing} onClick={props.onBulkRestore}>
-                  <RefreshCw size={14} className="btn-icon" /> {t('txt_restore')}
+                  <RefreshCw size={14} className="btn-icon" /> {mutationActionLabel('restore', props.mutationPhaseFor('restore'), t('txt_restore'))}
                 </button>
               )}
               {props.sidebarFilter.kind === 'archive' && (
                 <button type="button" className="btn btn-secondary small" disabled={props.busy || props.syncing} onClick={props.onBulkUnarchive}>
-                  <RotateCcw size={14} className="btn-icon" /> {t('txt_unarchive')}
+                  <RotateCcw size={14} className="btn-icon" /> {mutationActionLabel('unarchive', props.mutationPhaseFor('unarchive'), t('txt_unarchive'))}
                 </button>
               )}
               {props.sidebarFilter.kind !== 'trash' && props.sidebarFilter.kind !== 'archive' && props.sidebarFilter.kind !== 'duplicates' && (
