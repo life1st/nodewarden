@@ -504,10 +504,19 @@ export async function getPasswordHint(email: string): Promise<{ masterPasswordHi
   return { masterPasswordHint: body.masterPasswordHint ?? null };
 }
 
+const RETRYABLE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+export function isRetryableMethod(method: string | undefined): boolean {
+  return RETRYABLE_METHODS.has((method || 'GET').toUpperCase());
+}
+
 export function createAuthedFetch(getSession: () => SessionState | null, setSession: SessionSetter) {
   return async function authedFetch(input: string, init: RequestInit = {}): Promise<Response> {
+    // Non-idempotent writes (POST/PUT/PATCH/DELETE) must only be submitted once.
+    // A 401 happens before business execution, so refreshing the token and retrying
+    // once is still safe for every method.
+    const maxAttempts = isRetryableMethod(init.method) ? 3 : 1;
     const retryableRequest = async (headers: Headers): Promise<Response> => {
-      const maxAttempts = 3;
       let lastError: unknown;
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         try {
