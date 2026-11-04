@@ -32,12 +32,13 @@ export function findInlineCompletion(value: string, candidates: readonly string[
   const typed = String(value || '');
   if (!typed.trim()) return null;
   const lower = typed.toLowerCase();
+  let best: string | null = null;
   for (const candidate of candidates) {
-    if (candidate.length > typed.length && candidate.toLowerCase().startsWith(lower)) {
-      return candidate;
-    }
+    if (candidate.length <= typed.length) continue;
+    if (!candidate.toLowerCase().startsWith(lower)) continue;
+    if (best === null || candidate.length < best.length) best = candidate;
   }
-  return null;
+  return best;
 }
 
 export function findUsernameCompletion(value: string, usernames: readonly string[]): string | null {
