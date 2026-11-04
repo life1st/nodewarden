@@ -14,6 +14,7 @@ import {
   PasswordHistory,
 } from '../types';
 import { StorageService } from '../services/storage';
+import { isCipherWriteUnchanged } from '../services/storage-cipher-repo';
 import {
   notifyUserCipherCreate,
   notifyUserCipherDelete,
@@ -658,13 +659,15 @@ function readIncomingAttachmentMetadata(source: any): IncomingAttachmentMetadata
 
 async function syncIncomingAttachmentMetadata(
   storage: StorageService,
-  cipherId: string,
-  cipherData: any
+  cipherData: any,
+  attachments: Attachment[]
 ): Promise<void> {
   const incoming = readIncomingAttachmentMetadata(cipherData);
   if (!incoming.length) return;
 
-  const currentById = new Map((await storage.getAttachmentsByCipher(cipherId)).map((attachment) => [attachment.id, attachment]));
+  // The caller already fetched this snapshot (it is also what the response
+  // renders), so the merge mutates it in place instead of re-reading D1.
+  const currentById = new Map(attachments.map((attachment) => [attachment.id, attachment]));
   for (const item of incoming) {
     const attachment = currentById.get(item.id);
     if (!attachment) continue;
@@ -1117,16 +1120,36 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     if (!folderOk) return errorResponse('Folder not found', 404);
   }
 
-  if (!(await storage.updateCipherIfUnchanged(cipher, existingCipher.updatedAt))) {
+  const responseOptions = cipherResponseOptionsForRequest(request);
+
+  // D1-205: an identical save must not bump updated_at, must not touch the
+  // user revision and must not notify other clients. Payloads that actually
+  // change attachment metadata always take the write path, because that change
+  // lives outside the cipher row.
+  const incomingAttachmentMetadata = readIncomingAttachmentMetadata(cipherData);
+  const changesAttachmentMetadata = incomingAttachmentMetadata.some(
+    (item) => item.hasFileName || item.hasKey || item.hasFileSize
+  );
+  if (!changesAttachmentMetadata && isCipherWriteUnchanged(cipher, existingCipher)) {
+    const attachments = await storage.getAttachmentsByCipher(existingCipher.id);
+    return jsonResponse(cipherToResponse(existingCipher, attachments, responseOptions));
+  }
+
+  // D1-201: cipher update, conditional revision bump and the attachment
+  // snapshot for the response travel in one batch (one D1 round trip).
+  const revisionDate = new Date().toISOString();
+  const { updated, attachments } = await storage.updateCipherAndRevisionIfUnchanged(
+    cipher,
+    existingCipher.updatedAt,
+    revisionDate
+  );
+  if (!updated) {
     return errorResponse('The client copy of this cipher is out of date. Resync the client and try again.', 400);
   }
   // Rejected updates must not modify attachment metadata either.
-  await syncIncomingAttachmentMetadata(storage, cipher.id, cipherData);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  await syncIncomingAttachmentMetadata(storage, cipherData, attachments);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyCipherUpdateForRequest(request, env, cipher, revisionDate);
-  const attachments = await storage.getAttachmentsByCipher(cipher.id);
-  const responseOptions = cipherResponseOptionsForRequest(request);
 
   return jsonResponse(
     cipherToResponse(cipher, attachments, responseOptions)

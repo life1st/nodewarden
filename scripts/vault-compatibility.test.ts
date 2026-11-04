@@ -35,17 +35,59 @@ async function fixture(ctx: TestContext) {
     CREATE TABLE attachments(id TEXT PRIMARY KEY, cipher_id TEXT,
       file_name TEXT, size INTEGER, size_name TEXT, key TEXT);
     CREATE TABLE devices(user_id TEXT, push_token TEXT);
+    CREATE TABLE user_revisions(user_id TEXT PRIMARY KEY, revision_date TEXT);
   `);
+  // One counter per executed statement/batch: a D1 round trip is a run(), all(),
+  // first() or batch() call. Statements handed to batch() are prepared here but
+  // only executed inside the batch, so they count once.
+  const stats = { runs: 0, alls: 0, firsts: 0, batches: 0, pushLookups: 0 };
+  // The notification hub resolves push targets with its own device lookup; it
+  // is fan-out work, not part of the vault write path being measured here.
+  const isPushDeviceLookup = (sql: string) => /FROM\s+devices/i.test(sql);
+  const countStatement = (kind: 'runs' | 'alls' | 'firsts', sql: string) => {
+    if (isPushDeviceLookup(sql)) stats.pushLookups += 1;
+    else stats[kind] += 1;
+  };
+  const roundTrips = () => stats.runs + stats.alls + stats.firsts + stats.batches;
+  const execute = (sql: string, values: any[]) => {
+    const statement = sqlite.prepare(sql);
+    if (/^\s*(select|with|pragma)/i.test(sql)) {
+      return { kind: 'rows' as const, rows: statement.all(...values) };
+    }
+    const result = statement.run(...values);
+    return { kind: 'run' as const, changes: Number(result.changes) };
+  };
   const db: any = {
     prepare(sql: string) {
       let values: any[] = [];
       const statement = {
+        sql,
+        get values() { return values; },
         bind(...bound: any[]) { values = bound; return statement; },
-        async run() { const result = sqlite.prepare(sql).run(...values); return { success: true, meta: { changes: Number(result.changes) } }; },
-        async all() { return { success: true, results: sqlite.prepare(sql).all(...values) }; },
-        async first() { return sqlite.prepare(sql).get(...values) ?? null; },
+        async run() { countStatement('runs', sql); return { success: true, meta: { changes: (execute(sql, values) as any).changes ?? 0 } }; },
+        async all() { countStatement('alls', sql); return { success: true, results: (execute(sql, values) as any).rows ?? [] }; },
+        async first() { countStatement('firsts', sql); const out = execute(sql, values); return (out as any).rows?.[0] ?? null; },
       };
       return statement;
+    },
+    // Mirrors D1: statements run sequentially inside one transaction and any
+    // failure rolls the whole batch back.
+    async batch(statements: any[]) {
+      stats.batches += 1;
+      sqlite.exec('BEGIN');
+      try {
+        const results = statements.map((statement) => {
+          const out = execute(statement.sql, statement.values);
+          return out.kind === 'rows'
+            ? { success: true, results: out.rows, meta: { changes: 0 } }
+            : { success: true, results: [], meta: { changes: out.changes } };
+        });
+        sqlite.exec('COMMIT');
+        return results;
+      } catch (error) {
+        sqlite.exec('ROLLBACK');
+        throw error;
+      }
     },
   };
   ctx.mock.method(StorageService.prototype, 'updateRevisionDate', async () => revision);
@@ -81,7 +123,7 @@ async function fixture(ctx: TestContext) {
     return response;
   };
   const attachment = { id: attachmentId, cipherId: id, fileName: await encrypt('file.txt'), key: null, size: 7, sizeName: '7 B' };
-  return { storage, base, env, sqlite, route, deletedBlobs, notifications, attachment };
+  return { storage, base, env, sqlite, route, deletedBlobs, notifications, attachment, stats, roundTrips };
 }
 
 for (const method of ['PUT', 'POST']) {
@@ -157,10 +199,10 @@ test('stale updates less than a second apart cannot bypass checks with attachmen
 test('a write conflict detected after reading leaves attachment metadata untouched', async (ctx) => {
   const f = await fixture(ctx);
   await f.storage.saveAttachment(f.attachment);
-  const update = StorageService.prototype.updateCipherIfUnchanged;
-  ctx.mock.method(StorageService.prototype, 'updateCipherIfUnchanged', async function (this: StorageService, cipher: any, expected: string) {
+  const update = StorageService.prototype.updateCipherAndRevisionIfUnchanged;
+  ctx.mock.method(StorageService.prototype, 'updateCipherAndRevisionIfUnchanged', async function (this: StorageService, cipher: any, expected: string, revisionDate: string) {
     await f.storage.saveCipher({ ...f.base, updatedAt: '2026-10-04T00:00:01.000Z' });
-    return update.call(this, cipher, expected);
+    return update.call(this, cipher, expected, revisionDate);
   });
   assert.equal((await f.route(`/api/ciphers/${id}`, 'PUT', {
     name: await encrypt('Stale title'), lastKnownRevisionDate: revision,
@@ -168,6 +210,91 @@ test('a write conflict detected after reading leaves attachment metadata untouch
   })).status, 400);
   assert.equal((await f.storage.getAttachment(attachmentId))?.fileName, f.attachment.fileName);
   assert.equal(f.notifications.length, 0);
+  // The conditional batch lost, so the user revision must not move either.
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM user_revisions').get<any>().n, 0);
+});
+
+test('a normal save finishes in two D1 round trips and bumps the user revision once', async (ctx) => {
+  const f = await fixture(ctx);
+  await f.storage.saveAttachment(f.attachment);
+  const before = f.roundTrips();
+  const response = await f.route(`/api/ciphers/${id}`, 'PUT', {
+    name: await encrypt('Batched title'), lastKnownRevisionDate: revision,
+  });
+  assert.equal(response.status, 200);
+  const body: any = await response.json();
+  assert.equal(body.attachments?.[0]?.id, attachmentId, 'response reuses the batch attachment snapshot');
+  assert.equal(body.attachments?.[0]?.fileName, f.attachment.fileName);
+  const used = f.roundTrips() - before;
+  assert.ok(used <= 2, `expected at most 2 D1 round trips for a plain save, got ${used}`);
+
+  const stored = (await f.storage.getCipherForUser(id, owner))!;
+  assert.notEqual(stored.updatedAt, revision);
+  const revisions = f.sqlite.prepare('SELECT COUNT(*) AS n FROM user_revisions').get<any>();
+  assert.equal(revisions.n, 1);
+  const row = f.sqlite.prepare('SELECT revision_date FROM user_revisions WHERE user_id = ?').get(owner) as any;
+  assert.ok(row.revision_date, 'the batch must write the user revision');
+  assert.ok(f.notifications.length > 0, 'a successful change notifies sync listeners');
+});
+
+test('an identical repeat save writes nothing, keeps the user revision and stays silent', async (ctx) => {
+  const f = await fixture(ctx);
+  await f.storage.saveAttachment(f.attachment);
+  // First save normalizes the stored payload (nullable fields become explicit).
+  const first = { ...(await f.storage.getCipherForUser(id, owner))! };
+  assert.equal((await f.route(`/api/ciphers/${id}`, 'PUT', { ...first, lastKnownRevisionDate: first.updatedAt })).status, 200);
+  const afterFirst = (await f.storage.getCipherForUser(id, owner))!;
+  const revisionRow = f.sqlite.prepare('SELECT revision_date FROM user_revisions WHERE user_id = ?').get(owner) as any;
+  assert.ok(revisionRow);
+
+  const before = f.roundTrips();
+  const notificationsBefore = f.notifications.length;
+  const response = await f.route(`/api/ciphers/${id}`, 'PUT', {
+    ...afterFirst, lastKnownRevisionDate: afterFirst.updatedAt,
+  });
+  assert.equal(response.status, 200);
+  const body: any = await response.json();
+  assert.equal(body.attachments?.[0]?.id, attachmentId);
+  const used = f.roundTrips() - before;
+  assert.ok(used <= 2, `expected at most 2 D1 round trips for an unchanged save, got ${used}`);
+
+  const afterSecond = (await f.storage.getCipherForUser(id, owner))!;
+  assert.equal(afterSecond.updatedAt, afterFirst.updatedAt, 'no updated_at bump without a real change');
+  const revisionAfter = f.sqlite.prepare('SELECT revision_date FROM user_revisions WHERE user_id = ?').get(owner) as any;
+  assert.equal(revisionAfter.revision_date, revisionRow.revision_date, 'no revision bump without a real change');
+  assert.equal(f.notifications.length, notificationsBefore, 'no sync notification without a real change');
+});
+
+test('attachment metadata changes still take the write path for an otherwise identical cipher', async (ctx) => {
+  const f = await fixture(ctx);
+  await f.storage.saveAttachment(f.attachment);
+  const first = { ...(await f.storage.getCipherForUser(id, owner))! };
+  assert.equal((await f.route(`/api/ciphers/${id}`, 'PUT', { ...first, lastKnownRevisionDate: first.updatedAt })).status, 200);
+  const afterFirst = (await f.storage.getCipherForUser(id, owner))!;
+  const renamed = await encrypt('renamed.txt');
+  const response = await f.route(`/api/ciphers/${id}`, 'PUT', {
+    ...afterFirst,
+    lastKnownRevisionDate: afterFirst.updatedAt,
+    attachments2: { [attachmentId]: { fileName: renamed } },
+  });
+  assert.equal(response.status, 200);
+  const body: any = await response.json();
+  assert.equal(body.attachments?.[0]?.fileName, renamed);
+  const afterSecond = (await f.storage.getCipherForUser(id, owner))!;
+  assert.notEqual(afterSecond.updatedAt, afterFirst.updatedAt, 'metadata-only changes must not be skipped');
+  assert.equal((await f.storage.getAttachment(attachmentId))?.fileName, renamed, 'metadata is persisted');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM user_revisions').get<any>().n, 1);
+});
+
+test('a failing statement inside the update batch rolls the cipher write back', async (ctx) => {
+  const f = await fixture(ctx);
+  const stored = (await f.storage.getCipherForUser(id, owner))!;
+  const next = { ...stored, name: await encrypt('Rolled back title'), updatedAt: '2026-10-04T00:00:00.001Z' };
+  f.sqlite.exec('DROP TABLE user_revisions');
+  await assert.rejects(() => f.storage.updateCipherAndRevisionIfUnchanged(next, stored.updatedAt, '2026-10-04T00:00:00.002Z'));
+  const after = (await f.storage.getCipherForUser(id, owner))!;
+  assert.equal(after.name, stored.name, 'batch failure must roll the conditional UPDATE back');
+  assert.equal(after.updatedAt, stored.updatedAt);
 });
 
 test('concurrent saves from the same revision accept only one, even in the same millisecond', async (ctx) => {

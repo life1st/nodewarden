@@ -20,12 +20,42 @@ export async function getRevisionDate(db: D1Database, userId: string): Promise<s
 
 export async function updateRevisionDate(db: D1Database, userId: string): Promise<string> {
   const date = new Date().toISOString();
-  await db
+  await buildRevisionUpsertStatement(db, userId, date).run();
+  return date;
+}
+
+export function buildRevisionUpsertStatement(
+  db: D1Database,
+  userId: string,
+  revisionDate: string
+): D1PreparedStatement {
+  return db
     .prepare(
       'INSERT INTO user_revisions(user_id, revision_date) VALUES(?, ?) ' +
         'ON CONFLICT(user_id) DO UPDATE SET revision_date = excluded.revision_date'
     )
-    .bind(userId, date)
-    .run();
-  return date;
+    .bind(userId, revisionDate);
+}
+
+/**
+ * D1-201: revision upsert that only takes effect when the cipher row already
+ * carries `expectedCipherUpdatedAt`. Inside a `db.batch()` the statement runs
+ * after the conditional cipher UPDATE, so `expectedCipherUpdatedAt` must be
+ * the value written by that UPDATE (the new updated-at). A losing conditional
+ * update therefore never bumps the user revision.
+ */
+export function buildConditionalRevisionUpsertStatement(
+  db: D1Database,
+  userId: string,
+  revisionDate: string,
+  cipherId: string,
+  expectedCipherUpdatedAt: string
+): D1PreparedStatement {
+  return db
+    .prepare(
+      'INSERT INTO user_revisions(user_id, revision_date) ' +
+        'SELECT ?, ? WHERE EXISTS (SELECT 1 FROM ciphers WHERE id = ? AND user_id = ? AND updated_at = ?) ' +
+        'ON CONFLICT(user_id) DO UPDATE SET revision_date = excluded.revision_date'
+    )
+    .bind(userId, revisionDate, cipherId, userId, expectedCipherUpdatedAt);
 }

@@ -89,12 +89,8 @@ export async function bulkDeleteAttachmentsByIds(
   }
 }
 
-export async function getAttachmentsByCipher(db: D1Database, cipherId: string): Promise<Attachment[]> {
-  const res = await db
-    .prepare('SELECT id, cipher_id, file_name, size, size_name, key FROM attachments WHERE cipher_id = ?')
-    .bind(cipherId)
-    .all<any>();
-  return (res.results || []).map((r) => ({
+export function parseAttachmentRows(rows: readonly any[] | null | undefined): Attachment[] {
+  return (rows || []).map((r) => ({
     id: r.id,
     cipherId: r.cipher_id,
     fileName: r.file_name,
@@ -102,6 +98,17 @@ export async function getAttachmentsByCipher(db: D1Database, cipherId: string): 
     sizeName: r.size_name,
     key: r.key,
   }));
+}
+
+export function buildAttachmentsByCipherStatement(db: D1Database, cipherId: string): D1PreparedStatement {
+  return db
+    .prepare('SELECT id, cipher_id, file_name, size, size_name, key FROM attachments WHERE cipher_id = ?')
+    .bind(cipherId);
+}
+
+export async function getAttachmentsByCipher(db: D1Database, cipherId: string): Promise<Attachment[]> {
+  const res = await buildAttachmentsByCipherStatement(db, cipherId).all<any>();
+  return parseAttachmentRows(res.results);
 }
 
 export async function getAttachmentsByCipherIds(

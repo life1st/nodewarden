@@ -60,6 +60,7 @@ import {
   getCiphersPage as listStoredCiphersPage,
   saveCipher as saveStoredCipher,
   updateCipherIfUnchanged as updateStoredCipherIfUnchanged,
+  buildCipherUpdateStatement as buildStoredCipherUpdateStatement,
   deleteCipher as deleteStoredCipher,
 } from './storage-cipher-repo';
 import {
@@ -74,6 +75,8 @@ import {
   getAttachmentsByCipher as listStoredAttachmentsByCipher,
   getAttachmentsByCipherIds as listStoredAttachmentsByCipherIds,
   getAttachmentsByUserId as listStoredAttachmentsByUserId,
+  buildAttachmentsByCipherStatement as buildStoredAttachmentsByCipherStatement,
+  parseAttachmentRows as parseStoredAttachmentRows,
   saveAttachment as saveStoredAttachment,
   updateCipherRevisionDate as updateStoredCipherRevisionDate,
 } from './storage-attachment-repo';
@@ -142,6 +145,7 @@ import {
 import {
   getRevisionDate as getStoredRevisionDate,
   updateRevisionDate as updateStoredRevisionDate,
+  buildConditionalRevisionUpsertStatement as buildStoredConditionalRevisionUpsertStatement,
 } from './storage-revision-repo';
 import {
   getUserDomainSettings as getStoredUserDomainSettings,
@@ -499,6 +503,36 @@ export class StorageService {
 
   async updateCipherIfUnchanged(cipher: Cipher, expectedUpdatedAt: string): Promise<boolean> {
     return updateStoredCipherIfUnchanged(this.db, this.safeBind.bind(this), cipher, expectedUpdatedAt);
+  }
+
+  /**
+   * D1-201 / D1-203: runs the conditional cipher UPDATE, the conditional user
+   * revision upsert and the attachment snapshot read in a single `db.batch()`,
+   * so one save costs one D1 round trip on the write side. The revision
+   * statement only takes effect when the UPDATE matched (its EXISTS clause
+   * checks the updated-at the UPDATE just wrote), and the returned attachment
+   * rows replace the old post-update attachment read.
+   */
+  async updateCipherAndRevisionIfUnchanged(
+    cipher: Cipher,
+    expectedUpdatedAt: string,
+    revisionDate: string
+  ): Promise<{ updated: boolean; attachments: Attachment[] }> {
+    const statements = [
+      buildStoredCipherUpdateStatement(this.db, this.safeBind.bind(this), cipher, expectedUpdatedAt),
+      buildStoredConditionalRevisionUpsertStatement(
+        this.db,
+        cipher.userId,
+        revisionDate,
+        cipher.id,
+        cipher.updatedAt
+      ),
+      buildStoredAttachmentsByCipherStatement(this.db, cipher.id),
+    ];
+    const results = await this.db.batch(statements);
+    const updated = (results[0]?.meta?.changes ?? 0) === 1;
+    const attachments = parseStoredAttachmentRows(results[2]?.results as any[] | undefined);
+    return { updated, attachments };
   }
 
   async deleteCipher(id: string, userId: string): Promise<void> {

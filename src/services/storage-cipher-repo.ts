@@ -148,14 +148,14 @@ export async function saveCipher(db: D1Database, safeBind: SafeBind, cipher: Cip
 
 // A single conditional UPDATE prevents a competing save or deletion between
 // the handler's read and write from being overwritten (or resurrected).
-export async function updateCipherIfUnchanged(
+export function buildCipherUpdateStatement(
   db: D1Database,
   safeBind: SafeBind,
   cipher: Cipher,
   expectedUpdatedAt: string
-): Promise<boolean> {
+): D1PreparedStatement {
   const folderId = normalizeOptionalId(cipher.folderId);
-  const result = await safeBind(
+  return safeBind(
     db.prepare(
       'UPDATE ciphers SET type=?, folder_id=?, name=?, notes=?, favorite=?, data=?, reprompt=?, key=?, updated_at=?, archived_at=?, deleted_at=? ' +
       'WHERE id=? AND user_id=? AND updated_at=?'
@@ -163,8 +163,38 @@ export async function updateCipherIfUnchanged(
     Number(cipher.type) || 1, folderId, cipher.name, cipher.notes, cipher.favorite ? 1 : 0,
     buildCipherData(cipher, folderId), cipher.reprompt ?? 0, cipher.key, cipher.updatedAt,
     cipher.archivedAt ?? null, cipher.deletedAt, cipher.id, cipher.userId, expectedUpdatedAt
-  ).run();
+  );
+}
+
+export async function updateCipherIfUnchanged(
+  db: D1Database,
+  safeBind: SafeBind,
+  cipher: Cipher,
+  expectedUpdatedAt: string
+): Promise<boolean> {
+  const result = await buildCipherUpdateStatement(db, safeBind, cipher, expectedUpdatedAt).run();
   return result.meta.changes === 1;
+}
+
+// D1-205: compares exactly the values the conditional UPDATE would write, so a
+// save that carries no real change can skip both the cipher write and the
+// user revision bump. Updated-at is intentionally excluded: it is always a
+// fresh monotonic timestamp for writes that do happen.
+export function isCipherWriteUnchanged(next: Cipher, current: Cipher): boolean {
+  const nextFolderId = normalizeOptionalId(next.folderId);
+  const currentFolderId = normalizeOptionalId(current.folderId);
+  return (
+    (Number(next.type) || 1) === (Number(current.type) || 1) &&
+    nextFolderId === currentFolderId &&
+    (next.name ?? null) === (current.name ?? null) &&
+    (next.notes ?? null) === (current.notes ?? null) &&
+    !!next.favorite === !!current.favorite &&
+    (next.reprompt ?? 0) === (current.reprompt ?? 0) &&
+    (next.key ?? null) === (current.key ?? null) &&
+    (next.archivedAt ?? null) === (current.archivedAt ?? null) &&
+    (next.deletedAt ?? null) === (current.deletedAt ?? null) &&
+    buildCipherData(next, nextFolderId) === buildCipherData(current, currentFolderId)
+  );
 }
 
 function sanitizeIds(ids: string[]): string[] {
