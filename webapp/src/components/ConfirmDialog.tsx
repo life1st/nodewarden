@@ -22,6 +22,7 @@ interface ConfirmDialogProps {
   onCancel: () => void;
   children?: ComponentChildren;
   afterActions?: ComponentChildren;
+  cardClassName?: string;
 }
 
 function incrementDialogBodyLock() {
@@ -192,7 +193,7 @@ export default function ConfirmDialog(props: ConfirmDialogProps) {
     >
       <form
         ref={cardRef}
-        className={`dialog-card ${props.variant === 'warning' ? 'warning' : ''} ${props.open && !closing ? 'open' : ''} ${closing ? 'closing' : ''}`}
+        className={`dialog-card ${props.variant === 'warning' ? 'warning' : ''} ${props.open && !closing ? 'open' : ''} ${closing ? 'closing' : ''} ${props.cardClassName || ''}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

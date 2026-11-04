@@ -30,3 +30,40 @@
 .generator-inline-number { display: grid; grid-template-columns: minmax(0, 1fr) 72px; align-items: center; gap: 14px; margin: -3px 0 2px 50px; color: var(--muted); font-size: 13px; }.generator-inline-number .input { height: 34px; text-align: center; }
 @media (max-width: 760px) { .generator-page { width: 100%; padding: 0 0 18px; }.generator-layout { grid-template-columns: 1fr; grid-template-areas: 'output' 'options'; gap: 10px; }.generator-output-card, .generator-options-card { padding: 15px; border-radius: 16px; }.generator-value { min-height: 94px; margin: 14px 0 10px; padding: 14px; font-size: 19px; }.generator-meta-row { grid-template-columns: minmax(60px, 1fr) auto; }.generator-meta-row > span:last-child { grid-column: 1 / -1; }.generator-actions .btn { justify-content: center; padding-inline: 10px; }.generator-option-group { margin: 15px 0; }.generator-toggle { min-height: 44px; }.generator-number-field.compact { margin-left: 50px; }.generator-stepper { grid-template-columns: 40px 64px 40px; }.generator-stepper button { width: 40px; min-height: 44px; }.generator-stepper .input { height: 44px; }.generator-number-field.compact .generator-stepper { grid-template-columns: 36px 46px 36px; }.generator-number-field.compact .generator-stepper button { width: 36px; height: 40px; min-height: 40px; } }
 @media (prefers-reduced-motion: reduce) { .generator-toggle > span, .generator-toggle > span::after { transition: none; }.generator-spinner { animation: none; } }
+
+.dialog-card.generator-modal-card {
+  width: min(1040px, 100%);
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
+  text-align: left;
+}
+
+.generator-modal-card .dialog-title,
+.generator-modal-card .dialog-message {
+  text-align: center;
+}
+
+.generator-modal-card .generator-page {
+  width: 100%;
+  padding: 4px 0 8px;
+}
+
+.generator-modal-card .generator-layout {
+  grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr);
+}
+
+.generator-modal-card .generator-output-card,
+.generator-modal-card .generator-options-card {
+  box-shadow: none;
+}
+
+@media (max-width: 760px) {
+  .dialog-card.generator-modal-card {
+    width: min(560px, 100%);
+  }
+
+  .generator-modal-card .generator-layout {
+    grid-template-columns: 1fr;
+    grid-template-areas: 'output' 'options';
+  }
+}

@@ -10,7 +10,7 @@ const en: Record<string, string> = {
   "nav_generator": "Generator",
   "txt_password_generator": "Password Generator",
   "txt_password_generator_description": "Create a strong, unique password locally on this device.",
-  "txt_generator_type": "Generator type",
+  "txt_generate": "Generate", "txt_generator_type": "Generator type",
   "txt_passphrase": "Passphrase",
   "txt_generated_password": "Generated password",
   "txt_password_strength": "Strength",

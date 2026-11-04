@@ -10,7 +10,7 @@ const zhTW: Record<string, string> = {
   "nav_generator": "密碼產生器",
   "txt_password_generator": "密碼產生器",
   "txt_password_generator_description": "在此裝置本機建立強而唯一的密碼。",
-  "txt_generator_type": "產生類型",
+  "txt_generate": "產生", "txt_generator_type": "產生類型",
   "txt_passphrase": "密碼片語",
   "txt_generated_password": "已產生密碼",
   "txt_password_strength": "強度",

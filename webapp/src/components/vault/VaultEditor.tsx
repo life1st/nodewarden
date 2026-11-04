@@ -1,9 +1,10 @@
 import type { RefObject } from 'preact';
 import { createPortal } from 'preact/compat';
-import { ArrowDown, ArrowUp, CheckCheck, Download, Paperclip, Plus, QrCode, RefreshCw, Star, StarOff, Trash2, Upload, X } from 'lucide-preact';
+import { ArrowDown, ArrowUp, CheckCheck, Download, Paperclip, Plus, QrCode, RefreshCw, Star, StarOff, Trash2, Upload, WandSparkles, X } from 'lucide-preact';
 import jsQR from 'jsqr';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useDialogLifecycle } from '@/components/ConfirmDialog';
+import PasswordGeneratorModal from '@/components/PasswordGeneratorModal';
 import { normalizeTotpInput } from '@/lib/crypto';
 import type { Cipher, Folder, VaultDraft, VaultDraftField } from '@/lib/types';
 import { t } from '@/lib/i18n';
@@ -145,6 +146,7 @@ export default function VaultEditor(props: VaultEditorProps) {
   const [totpQrOpen, setTotpQrOpen] = useState(false);
   const [totpQrStatus, setTotpQrStatus] = useState('');
   const [totpQrBusy, setTotpQrBusy] = useState(false);
+  const [passwordGeneratorOpen, setPasswordGeneratorOpen] = useState(false);
   useDialogLifecycle(totpQrOpen, () => setTotpQrOpen(false));
 
   const stopTotpQrScanner = () => {
@@ -402,7 +404,19 @@ export default function VaultEditor(props: VaultEditorProps) {
             </label>
             <label className="field">
               <span>{t('txt_password')}</span>
-              <input className="input" value={props.draft.loginPassword} onInput={(e) => props.onUpdateDraft({ loginPassword: (e.currentTarget as HTMLInputElement).value })} />
+              <div className="input-action-wrap">
+                <input className="input" value={props.draft.loginPassword} onInput={(e) => props.onUpdateDraft({ loginPassword: (e.currentTarget as HTMLInputElement).value })} />
+                <button
+                  type="button"
+                  className="input-icon-btn"
+                  title={t('txt_generate')}
+                  aria-label={t('txt_generate')}
+                  disabled={props.busy}
+                  onClick={() => setPasswordGeneratorOpen(true)}
+                >
+                  <WandSparkles size={18} className="btn-icon" />
+                </button>
+              </div>
             </label>
           </div>
           <label className="field">
@@ -807,6 +821,14 @@ export default function VaultEditor(props: VaultEditorProps) {
         )}
       </div>
       {props.localError && <div className="local-error">{props.localError}</div>}
+      <PasswordGeneratorModal
+        open={passwordGeneratorOpen}
+        onCancel={() => setPasswordGeneratorOpen(false)}
+        onConfirm={(value) => {
+          props.onUpdateDraft({ loginPassword: value });
+          setPasswordGeneratorOpen(false);
+        }}
+      />
       {totpQrOpen && typeof document !== 'undefined' ? createPortal((
         <div className="dialog-mask totp-scan-mask open" onClick={(event) => event.target === event.currentTarget && setTotpQrOpen(false)}>
           <section className="dialog-card totp-scan-dialog open" role="dialog" aria-modal="true" aria-label={t('txt_scan_totp_qr')}>
