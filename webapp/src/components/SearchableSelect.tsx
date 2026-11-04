@@ -195,6 +195,12 @@ export default function SearchableSelect(props: SearchableSelectProps) {
     setActiveIndex(-1);
   };
 
+  const resolveOptionByLabel = (text: string): SearchableSelectOption | null => {
+    const target = normalized(text);
+    if (!target) return null;
+    return props.options.find((option) => !option.disabled && normalized(option.label) === target) || null;
+  };
+
   const applyCompletion = (value: string) => {
     const match = findInlineCompletion(value, completionCandidates);
     if (!match) {
@@ -288,10 +294,20 @@ export default function SearchableSelect(props: SearchableSelectProps) {
   };
 
   const handleBlur = () => {
+    const wasComposing = composingRef.current;
     composingRef.current = false;
     beforeInputRef.current = null;
     pendingSelectionRef.current = null;
     suppressedValueRef.current = null;
+    if (wasComposing) return;
+    const match = resolveOptionByLabel(query);
+    if (match) {
+      if (match.value !== props.value) props.onChange(match.value);
+      setQuery(match.label);
+    } else {
+      setQuery(displayLabel);
+    }
+    setEdited(false);
   };
 
   const moveActive = (delta: number) => {
@@ -380,6 +396,9 @@ export default function SearchableSelect(props: SearchableSelectProps) {
             if (!open) return;
             event.preventDefault();
             closeList();
+            // Escape discards the typed text, so a later blur must not commit it.
+            setQuery(displayLabel);
+            setEdited(false);
             return;
           }
           if (event.key === 'Tab' && open) closeList();
