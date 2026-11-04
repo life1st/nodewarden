@@ -33,6 +33,7 @@ import {
 } from '@/components/vault/vault-page-helpers';
 import { calcTotpNow, type TotpCodeResult } from '@/lib/crypto';
 import { computeSshFingerprint, generateDefaultSshKeyMaterial } from '@/lib/ssh';
+import { buildLoginUsernameIndex } from '@/lib/username-autocomplete';
 import { ChevronLeft } from 'lucide-preact';
 import type { Cipher, CustomFieldType, Folder, VaultDraft, VaultDraftField } from '@/lib/types';
 import { t } from '@/lib/i18n';
@@ -134,6 +135,10 @@ export default function VaultPage(props: VaultPageProps) {
   const listScrollBucketRef = useRef(0);
   const [listScrollTop, setListScrollTop] = useState(0);
   const [listViewportHeight, setListViewportHeight] = useState(0);
+  const loginUsernameSuggestions = useMemo(
+    () => (isCreating && draft?.type === 1 ? buildLoginUsernameIndex(props.ciphers) : []),
+    [draft?.type, isCreating, props.ciphers]
+  );
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
@@ -1306,6 +1311,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
                 busy={busy}
                 folders={props.folders}
                 selectedCipher={selectedCipher}
+                loginUsernameSuggestions={loginUsernameSuggestions}
                 editExistingAttachments={editExistingAttachments}
                 removedAttachmentIds={removedAttachmentIds}
                 removedAttachmentCount={removedAttachmentCount}

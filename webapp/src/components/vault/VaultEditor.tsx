@@ -2,10 +2,11 @@ import type { RefObject } from 'preact';
 import { createPortal } from 'preact/compat';
 import { ArrowDown, ArrowUp, CheckCheck, Download, Paperclip, Plus, QrCode, RefreshCw, Star, StarOff, Trash2, Upload, WandSparkles, X } from 'lucide-preact';
 import jsQR from 'jsqr';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useDialogLifecycle } from '@/components/ConfirmDialog';
 import PasswordGeneratorModal from '@/components/PasswordGeneratorModal';
 import { normalizeTotpInput } from '@/lib/crypto';
+import { findUsernameCompletion } from '@/lib/username-autocomplete';
 import type { Cipher, Folder, VaultDraft, VaultDraftField } from '@/lib/types';
 import { t } from '@/lib/i18n';
 import { cardBrand } from '@/lib/import-format-shared';
@@ -28,6 +29,7 @@ interface VaultEditorProps {
   busy: boolean;
   folders: Folder[];
   selectedCipher: Cipher | null;
+  loginUsernameSuggestions?: string[];
   editExistingAttachments: Array<any>;
   removedAttachmentIds: Record<string, boolean>;
   removedAttachmentCount: number;
@@ -147,7 +149,28 @@ export default function VaultEditor(props: VaultEditorProps) {
   const [totpQrStatus, setTotpQrStatus] = useState('');
   const [totpQrBusy, setTotpQrBusy] = useState(false);
   const [passwordGeneratorOpen, setPasswordGeneratorOpen] = useState(false);
+  const usernameInputRef = useRef<HTMLInputElement | null>(null);
+  const usernameComposingRef = useRef(false);
+  const usernameBeforeInputRef = useRef<{
+    value: string;
+    selectionStart: number;
+    selectionEnd: number;
+  } | null>(null);
+  const usernamePendingSelectionRef = useRef<{ start: number; end: number; full: string } | null>(null);
+  const usernameSuppressedValueRef = useRef<string | null>(null);
+  const [usernameSelectionNonce, setUsernameSelectionNonce] = useState(0);
   useDialogLifecycle(totpQrOpen, () => setTotpQrOpen(false));
+
+  useLayoutEffect(() => {
+    const pending = usernamePendingSelectionRef.current;
+    const input = usernameInputRef.current;
+    if (!pending || !input) return;
+    usernamePendingSelectionRef.current = null;
+    const max = input.value.length;
+    const start = Math.max(0, Math.min(pending.start, max));
+    const end = Math.max(start, Math.min(pending.end, max));
+    input.setSelectionRange(start, end);
+  }, [props.draft.loginUsername, usernameSelectionNonce]);
 
   const stopTotpQrScanner = () => {
     if (totpQrFrameRef.current != null) {
@@ -333,6 +356,122 @@ export default function VaultEditor(props: VaultEditorProps) {
           percent: props.attachmentUploadPercent,
         });
 
+  const usernameCompletionEnabled = props.isCreating && props.draft.type === 1;
+
+  function commitLoginUsername(value: string): void {
+    props.onUpdateDraft({ loginUsername: value });
+  }
+
+  function applyUsernameCompletion(value: string): void {
+    if (!usernameCompletionEnabled) {
+      usernamePendingSelectionRef.current = null;
+      commitLoginUsername(value);
+      return;
+    }
+    const match = findUsernameCompletion(value, props.loginUsernameSuggestions || []);
+    if (!match) {
+      if (usernamePendingSelectionRef.current?.full === value) {
+        commitLoginUsername(value);
+        return;
+      }
+      usernamePendingSelectionRef.current = null;
+      commitLoginUsername(value);
+      return;
+    }
+    commitLoginUsername(match);
+    usernamePendingSelectionRef.current = { start: value.length, end: match.length, full: match };
+    setUsernameSelectionNonce((current) => current + 1);
+  }
+
+  function handleUsernameBeforeInput(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    usernameBeforeInputRef.current = {
+      value: input.value,
+      selectionStart: input.selectionStart ?? input.value.length,
+      selectionEnd: input.selectionEnd ?? input.value.length,
+    };
+  }
+
+  function handleUsernameInput(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    const nativeEvent = event as InputEvent;
+    const value = input.value;
+    const inputType = typeof nativeEvent.inputType === 'string' ? nativeEvent.inputType : '';
+    const composing = usernameComposingRef.current || nativeEvent.isComposing || inputType === 'insertCompositionText';
+    const before = usernameBeforeInputRef.current;
+    usernameBeforeInputRef.current = null;
+
+    if (!usernameCompletionEnabled) {
+      usernamePendingSelectionRef.current = null;
+      usernameSuppressedValueRef.current = null;
+      commitLoginUsername(value);
+      return;
+    }
+
+    if (composing) {
+      usernamePendingSelectionRef.current = null;
+      commitLoginUsername(value);
+      return;
+    }
+
+    const selectionReplaced = !!before && before.selectionEnd > before.selectionStart;
+    const deletion = inputType.startsWith('delete')
+      || (!inputType && !selectionReplaced && !!before && value.length < before.value.length);
+
+    if (deletion) {
+      usernameSuppressedValueRef.current = value;
+      usernamePendingSelectionRef.current = null;
+      commitLoginUsername(value);
+      return;
+    }
+
+    if (!inputType && usernameSuppressedValueRef.current === value) {
+      usernamePendingSelectionRef.current = null;
+      commitLoginUsername(value);
+      return;
+    }
+
+    usernameSuppressedValueRef.current = null;
+    const caret = input.selectionStart;
+    if (caret != null && caret !== value.length) {
+      usernamePendingSelectionRef.current = null;
+      commitLoginUsername(value);
+      return;
+    }
+
+    applyUsernameCompletion(value);
+  }
+
+  function handleUsernameCompositionStart(): void {
+    usernameComposingRef.current = true;
+    usernamePendingSelectionRef.current = null;
+  }
+
+  function handleUsernameCompositionEnd(event: Event): void {
+    usernameComposingRef.current = false;
+    usernameBeforeInputRef.current = null;
+    usernameSuppressedValueRef.current = null;
+    const input = event.currentTarget as HTMLInputElement;
+    const value = input.value;
+    const caret = input.selectionStart;
+    if (caret != null && caret !== value.length) {
+      commitLoginUsername(value);
+      return;
+    }
+    applyUsernameCompletion(value);
+  }
+
+  function handleUsernameBlur(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    usernameComposingRef.current = false;
+    usernameBeforeInputRef.current = null;
+    usernamePendingSelectionRef.current = null;
+    usernameSuppressedValueRef.current = null;
+    if (input.value !== props.draft.loginUsername) {
+      commitLoginUsername(input.value);
+    }
+  }
+
   const addLoginUri = () => {
     props.onUpdateDraft({ loginUris: [...props.draft.loginUris, createEmptyLoginUri()] });
   };
@@ -400,7 +539,18 @@ export default function VaultEditor(props: VaultEditorProps) {
           <div className="field-grid">
             <label className="field">
               <span>{t('txt_username')}</span>
-              <input className="input" value={props.draft.loginUsername} onInput={(e) => props.onUpdateDraft({ loginUsername: (e.currentTarget as HTMLInputElement).value })} />
+              <input
+                ref={usernameInputRef}
+                className="input"
+                value={props.draft.loginUsername}
+                autoComplete="off"
+                aria-autocomplete="inline"
+                onBeforeInput={handleUsernameBeforeInput}
+                onInput={handleUsernameInput}
+                onCompositionStart={handleUsernameCompositionStart}
+                onCompositionEnd={handleUsernameCompositionEnd}
+                onBlur={handleUsernameBlur}
+              />
             </label>
             <label className="field">
               <span>{t('txt_password')}</span>
