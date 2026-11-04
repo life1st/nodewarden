@@ -28,14 +28,18 @@ export function buildLoginUsernameIndex(ciphers: readonly Cipher[]): string[] {
   return usernames;
 }
 
-export function findUsernameCompletion(value: string, usernames: readonly string[]): string | null {
+export function findInlineCompletion(value: string, candidates: readonly string[]): string | null {
   const typed = String(value || '');
   if (!typed.trim()) return null;
   const lower = typed.toLowerCase();
-  for (const username of usernames) {
-    if (username.length > typed.length && username.toLowerCase().startsWith(lower)) {
-      return username;
+  for (const candidate of candidates) {
+    if (candidate.length > typed.length && candidate.toLowerCase().startsWith(lower)) {
+      return candidate;
     }
   }
   return null;
+}
+
+export function findUsernameCompletion(value: string, usernames: readonly string[]): string | null {
+  return findInlineCompletion(value, usernames);
 }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { createPortal } from 'preact/compat';
 import { Check, ChevronDown } from 'lucide-preact';
 import { t } from '@/lib/i18n';
+import { findInlineCompletion } from '@/lib/username-autocomplete';
 
 export interface SearchableSelectOption {
   value: string;
@@ -47,9 +48,35 @@ export default function SearchableSelect(props: SearchableSelectProps) {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [edited, setEdited] = useState(false);
   const [composing, setComposing] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [menuPosition, setMenuPosition] = useState<MenuPosition | null>(null);
+  const composingRef = useRef(false);
+  const beforeInputRef = useRef<{
+    value: string;
+    selectionStart: number;
+    selectionEnd: number;
+  } | null>(null);
+  const pendingSelectionRef = useRef<{ start: number; end: number; full: string } | null>(null);
+  const suppressedValueRef = useRef<string | null>(null);
+  const [selectionNonce, setSelectionNonce] = useState(0);
+
+  const completionCandidates = useMemo(
+    () => props.options.filter((option) => !option.disabled).map((option) => option.label),
+    [props.options]
+  );
+
+  useLayoutEffect(() => {
+    const pending = pendingSelectionRef.current;
+    const input = inputRef.current;
+    if (!pending || !input) return;
+    pendingSelectionRef.current = null;
+    const max = input.value.length;
+    const start = Math.max(0, Math.min(pending.start, max));
+    const end = Math.max(start, Math.min(pending.end, max));
+    input.setSelectionRange(start, end);
+  }, [query, selectionNonce]);
 
   const selectedOption = useMemo(
     () => props.options.find((option) => option.value === props.value),
@@ -60,16 +87,22 @@ export default function SearchableSelect(props: SearchableSelectProps) {
 
   const effectiveQuery = composing ? '' : query;
   const normalizedQuery = normalized(effectiveQuery);
-  const showAllOptions = !normalizedQuery || normalizedQuery === displayLabelNormalized;
+  const showAllOptions = !normalizedQuery || (normalizedQuery === displayLabelNormalized && !edited);
 
   const visibleOptions = useMemo(() => {
     const pinnedOptions = props.options.filter((option) => option.pinned);
     const regularOptions = props.options.filter((option) => !option.pinned);
     if (showAllOptions) return [...pinnedOptions, ...regularOptions];
-    return [
-      ...pinnedOptions,
-      ...regularOptions.filter((option) => normalized(option.label).includes(normalizedQuery)),
-    ];
+    const matchedOptions = regularOptions
+      .map((option, index) => ({
+        option,
+        index,
+        matchIndex: normalized(option.label).indexOf(normalizedQuery),
+      }))
+      .filter((entry) => entry.matchIndex >= 0)
+      .sort((a, b) => a.matchIndex - b.matchIndex || a.index - b.index)
+      .map((entry) => entry.option);
+    return [...pinnedOptions, ...matchedOptions];
   }, [props.options, showAllOptions, normalizedQuery]);
 
   const updatePosition = useCallback(() => {
@@ -145,6 +178,7 @@ export default function SearchableSelect(props: SearchableSelectProps) {
     if (props.disabled) return;
     setOpen(true);
     setQuery(displayLabel);
+    setEdited(false);
     setActiveIndex(props.options.findIndex((option) => option.value === props.value));
   };
 
@@ -159,6 +193,105 @@ export default function SearchableSelect(props: SearchableSelectProps) {
     setQuery(option.label);
     setOpen(false);
     setActiveIndex(-1);
+  };
+
+  const applyCompletion = (value: string) => {
+    const match = findInlineCompletion(value, completionCandidates);
+    if (!match) {
+      if (pendingSelectionRef.current?.full === value) {
+        setQuery(value);
+        return;
+      }
+      pendingSelectionRef.current = null;
+      setQuery(value);
+      return;
+    }
+    setQuery(match);
+    pendingSelectionRef.current = { start: value.length, end: match.length, full: match };
+    setSelectionNonce((current) => current + 1);
+  };
+
+  const handleBeforeInput = (event: Event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    beforeInputRef.current = {
+      value: input.value,
+      selectionStart: input.selectionStart ?? input.value.length,
+      selectionEnd: input.selectionEnd ?? input.value.length,
+    };
+  };
+
+  const handleInput = (event: Event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    const nativeEvent = event as InputEvent;
+    const value = input.value;
+    const inputType = typeof nativeEvent.inputType === 'string' ? nativeEvent.inputType : '';
+    const isComposing = composingRef.current || nativeEvent.isComposing || inputType === 'insertCompositionText';
+    const before = beforeInputRef.current;
+    beforeInputRef.current = null;
+
+    if (!open) setOpen(true);
+    setEdited(true);
+
+    if (isComposing) {
+      pendingSelectionRef.current = null;
+      setQuery(value);
+      return;
+    }
+
+    const selectionReplaced = !!before && before.selectionEnd > before.selectionStart;
+    const deletion = inputType.startsWith('delete')
+      || (!inputType && !selectionReplaced && !!before && value.length < before.value.length);
+
+    if (deletion) {
+      suppressedValueRef.current = value;
+      pendingSelectionRef.current = null;
+      setQuery(value);
+      return;
+    }
+
+    if (!inputType && suppressedValueRef.current === value) {
+      pendingSelectionRef.current = null;
+      setQuery(value);
+      return;
+    }
+
+    suppressedValueRef.current = null;
+    const caret = input.selectionStart;
+    if (caret != null && caret !== value.length) {
+      pendingSelectionRef.current = null;
+      setQuery(value);
+      return;
+    }
+
+    applyCompletion(value);
+  };
+
+  const handleCompositionStart = () => {
+    composingRef.current = true;
+    pendingSelectionRef.current = null;
+    setComposing(true);
+  };
+
+  const handleCompositionEnd = (event: Event) => {
+    composingRef.current = false;
+    beforeInputRef.current = null;
+    suppressedValueRef.current = null;
+    setComposing(false);
+    const input = event.currentTarget as HTMLInputElement;
+    const value = input.value;
+    const caret = input.selectionStart;
+    if (caret != null && caret !== value.length) {
+      setQuery(value);
+      return;
+    }
+    applyCompletion(value);
+  };
+
+  const handleBlur = () => {
+    composingRef.current = false;
+    beforeInputRef.current = null;
+    pendingSelectionRef.current = null;
+    suppressedValueRef.current = null;
   };
 
   const moveActive = (delta: number) => {
@@ -193,7 +326,7 @@ export default function SearchableSelect(props: SearchableSelectProps) {
         aria-label={props.ariaLabel}
         aria-expanded={open}
         aria-controls={open ? listboxId : undefined}
-        aria-autocomplete="list"
+        aria-autocomplete="both"
         aria-activedescendant={activeDescendant}
         value={open ? query : displayLabel}
         placeholder={props.placeholder}
@@ -216,15 +349,11 @@ export default function SearchableSelect(props: SearchableSelectProps) {
             if (document.activeElement === input) input?.select();
           });
         }}
-        onInput={(event) => {
-          if (!open) setOpen(true);
-          setQuery(event.currentTarget.value);
-        }}
-        onCompositionStart={() => setComposing(true)}
-        onCompositionEnd={(event) => {
-          setComposing(false);
-          setQuery(event.currentTarget.value);
-        }}
+        onBeforeInput={handleBeforeInput}
+        onInput={handleInput}
+        onCompositionStart={handleCompositionStart}
+        onCompositionEnd={handleCompositionEnd}
+        onBlur={handleBlur}
         onKeyDown={(event) => {
           if (event.isComposing) return;
           if (event.key === 'ArrowDown') {

@@ -1,6 +1,7 @@
 import ConfirmDialog from '@/components/ConfirmDialog';
+import SearchableSelect from '@/components/SearchableSelect';
 import type { CustomFieldType, Folder } from '@/lib/types';
-import { getFieldTypeOptions, toBooleanFieldValue } from '@/components/vault/vault-page-helpers';
+import { folderDisplayName, getFieldTypeOptions, toBooleanFieldValue } from '@/components/vault/vault-page-helpers';
 import { t } from '@/lib/i18n';
 
 interface VaultDialogsProps {
@@ -169,17 +170,22 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         onConfirm={props.onConfirmMove}
         onCancel={props.onCancelMove}
       >
-        <label className="field">
+        <div className="field">
           <span>{t('txt_folder')}</span>
-          <select className="input" value={props.moveFolderId} onInput={(e) => props.onMoveFolderIdChange((e.currentTarget as HTMLSelectElement).value)}>
-            <option value="__none__">{t('txt_no_folder')}</option>
-            {props.folders.map((folder) => (
-              <option key={folder.id} value={folder.id}>
-                {folder.decName || folder.name || folder.id}
-              </option>
-            ))}
-          </select>
-        </label>
+          <SearchableSelect
+            value={props.moveFolderId}
+            options={[
+              { value: '__none__', label: t('txt_no_folder'), pinned: true },
+              ...props.folders.map((folder) => ({
+                value: folder.id,
+                label: folderDisplayName(folder),
+              })),
+            ]}
+            onChange={props.onMoveFolderIdChange}
+            placeholder={t('txt_select')}
+            ariaLabel={t('txt_folder')}
+          />
+        </div>
       </ConfirmDialog>
 
       <ConfirmDialog
