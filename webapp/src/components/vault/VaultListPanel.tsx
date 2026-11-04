@@ -48,6 +48,7 @@ interface VirtualRange {
 
 interface VaultListPanelProps {
   busy: boolean;
+  syncing: boolean;
   loading: boolean;
   error: string;
   folders: Folder[];
@@ -295,26 +296,26 @@ export default function VaultListPanel(props: VaultListPanelProps) {
                 <X size={14} className="btn-icon" /> {t('txt_cancel')}
               </button>
               {props.sidebarFilter.kind === 'trash' && (
-                <button type="button" className="btn btn-secondary small" disabled={props.busy} onClick={props.onBulkRestore}>
+                <button type="button" className="btn btn-secondary small" disabled={props.busy || props.syncing} onClick={props.onBulkRestore}>
                   <RefreshCw size={14} className="btn-icon" /> {t('txt_restore')}
                 </button>
               )}
               {props.sidebarFilter.kind === 'archive' && (
-                <button type="button" className="btn btn-secondary small" disabled={props.busy} onClick={props.onBulkUnarchive}>
+                <button type="button" className="btn btn-secondary small" disabled={props.busy || props.syncing} onClick={props.onBulkUnarchive}>
                   <RotateCcw size={14} className="btn-icon" /> {t('txt_unarchive')}
                 </button>
               )}
               {props.sidebarFilter.kind !== 'trash' && props.sidebarFilter.kind !== 'archive' && props.sidebarFilter.kind !== 'duplicates' && (
-                <button type="button" className="btn btn-secondary small" disabled={props.busy} onClick={props.onBulkArchive}>
+                <button type="button" className="btn btn-secondary small" disabled={props.busy || props.syncing} onClick={props.onBulkArchive}>
                   <Archive size={14} className="btn-icon" /> {t('txt_archive_selected')}
                 </button>
               )}
               {props.sidebarFilter.kind !== 'trash' && props.sidebarFilter.kind !== 'archive' && props.sidebarFilter.kind !== 'duplicates' && (
-                <button type="button" className="btn btn-secondary small" disabled={props.busy} onClick={props.onOpenMove}>
+                <button type="button" className="btn btn-secondary small" disabled={props.busy || props.syncing} onClick={props.onOpenMove}>
                   <FolderInput size={14} className="btn-icon" /> {t('txt_move')}
                 </button>
               )}
-              <button type="button" className="btn btn-danger small" disabled={props.busy} onClick={props.onOpenBulkDelete}>
+              <button type="button" className="btn btn-danger small" disabled={props.busy || props.syncing} onClick={props.onOpenBulkDelete}>
                 <Trash2 size={14} className="btn-icon" /> {props.sidebarFilter.kind === 'trash' ? t('txt_delete_permanently') : t('txt_delete_selected')}
               </button>
             </>
@@ -388,8 +389,8 @@ export default function VaultListPanel(props: VaultListPanelProps) {
                   </div>
                 )}
               </div>
-              <button type="button" className="btn btn-secondary small list-icon-btn" disabled={props.busy || props.loading} onClick={props.onSyncVault}>
-                <RefreshCw size={14} className="btn-icon" /> {t('txt_sync_vault')}
+              <button type="button" className="btn btn-secondary small list-icon-btn" disabled={props.syncing || props.loading} onClick={props.onSyncVault}>
+                <RefreshCw size={14} className="btn-icon" /> {props.syncing ? t('txt_syncing') : t('txt_sync_vault')}
               </button>
               {props.sidebarFilter.kind === 'duplicates' && !props.isMobileLayout ? (
                 <button type="button" className="btn btn-secondary small" onClick={props.onSelectUniqueFromDuplicates}>
@@ -417,8 +418,8 @@ export default function VaultListPanel(props: VaultListPanelProps) {
         {!props.loading && !!props.error && !props.filteredCiphers.length && (
           <div className="empty vault-error-state">
             <strong>{props.error}</strong>
-            <button type="button" className="btn btn-secondary small" disabled={props.busy} onClick={props.onSyncVault}>
-              {t('txt_retry_sync')}
+            <button type="button" className="btn btn-secondary small" disabled={props.syncing} onClick={props.onSyncVault}>
+              {props.syncing ? t('txt_syncing') : t('txt_retry_sync')}
             </button>
           </div>
         )}

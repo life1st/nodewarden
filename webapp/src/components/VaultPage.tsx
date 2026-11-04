@@ -34,6 +34,8 @@ import {
 import { calcTotpNow, type TotpCodeResult } from '@/lib/crypto';
 import { computeSshFingerprint, generateDefaultSshKeyMaterial } from '@/lib/ssh';
 import { buildLoginUsernameIndex } from '@/lib/username-autocomplete';
+import { NEW_CIPHER_WRITE_TARGET, VAULT_WRITE_KEY, type MutationKind, type MutationState } from '@/lib/api/write-queue';
+import useWriteQueueState from '@/hooks/useWriteQueueState';
 import { ChevronLeft } from 'lucide-preact';
 import type { Cipher, CustomFieldType, Folder, VaultDraft, VaultDraftField } from '@/lib/types';
 import { t } from '@/lib/i18n';
@@ -115,7 +117,10 @@ export default function VaultPage(props: VaultPageProps) {
   const [hiddenFieldVisibleMap, setHiddenFieldVisibleMap] = useState<Record<number, boolean>>({});
   const [attachmentQueue, setAttachmentQueue] = useState<File[]>([]);
   const [removedAttachmentIds, setRemovedAttachmentIds] = useState<Record<string, boolean>>({});
-  const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [repromptVerifying, setRepromptVerifying] = useState(false);
+  const [failedMutation, setFailedMutation] = useState<{ kind: MutationKind; cipherId: string } | null>(null);
+  const writeState = useWriteQueueState(VAULT_WRITE_KEY);
   const [repromptOpen, setRepromptOpen] = useState(false);
   const [repromptPassword, setRepromptPassword] = useState('');
   const [repromptApprovedCipherId, setRepromptApprovedCipherId] = useState<string | null>(null);
@@ -158,14 +163,6 @@ export default function VaultPage(props: VaultPageProps) {
     mobileSidebarToggleKeyRef.current = props.mobileSidebarToggleKey;
     setMobileSidebarOpen((open) => !open);
   }, [props.mobileSidebarToggleKey]);
-
-  useEffect(() => {
-    const onQuickAdd = () => {
-      startCreate(1);
-    };
-    window.addEventListener('nodewarden:add-item', onQuickAdd);
-    return () => window.removeEventListener('nodewarden:add-item', onQuickAdd);
-  }, []);
 
   useEffect(() => {
     try {
@@ -278,6 +275,7 @@ export default function VaultPage(props: VaultPageProps) {
     setRepromptOpen(false);
     setShowPassword(false);
     setHiddenFieldVisibleMap({});
+    setFailedMutation(null);
   }, [selectedCipherId]);
 
   useEffect(() => {
@@ -631,6 +629,33 @@ export default function VaultPage(props: VaultPageProps) {
   );
   const totalCipherCount = filteredCiphers.length;
 
+  const activeMutations = useMemo(() => {
+    const list: MutationState[] = [];
+    if (writeState.current) list.push(writeState.current);
+    for (const entry of writeState.queued) list.push(entry);
+    return list;
+  }, [writeState]);
+  const hasPendingMutation = writeState.pending > 0;
+  const draftTargetId = draft?.id || (isCreating ? NEW_CIPHER_WRITE_TARGET : selectedCipherId);
+  const isSavingCurrentDraft = activeMutations.some((mutation) => mutation.kind === 'save' && mutation.cipherId === draftTargetId);
+  const draftSaveRunning =
+    !!writeState.current && writeState.current.kind === 'save' && writeState.current.cipherId === draftTargetId;
+  // Only report the pending id that belongs to the selected item, so other
+  // items' action buttons stay usable while something else is being written.
+  const pendingCipherId = activeMutations.find((mutation) => mutation.cipherId === selectedCipherId)?.cipherId;
+  const saveStatus: 'queued' | 'running' | 'error' | null = isSavingCurrentDraft
+    ? draftSaveRunning
+      ? 'running'
+      : 'queued'
+    : failedMutation?.kind === 'save' && failedMutation.cipherId === draftTargetId
+      ? 'error'
+      : null;
+
+  // A new write invalidates the previous failure hint.
+  useEffect(() => {
+    if (writeState.current) setFailedMutation(null);
+  }, [writeState.current?.id]);
+
 const folderName = useCallback((id: string | null | undefined): string => {
   if (!id) return t('txt_no_folder');
   const folder = folderById.get(id);
@@ -658,6 +683,11 @@ const folderName = useCallback((id: string | null | undefined): string => {
   }, []);
 
   const startCreate = useCallback((type: number): void => {
+    // D1-105: never open a new editor while a write is still pending.
+    if (hasPendingMutation) {
+      props.onNotify('warning', t('txt_wait_for_pending_write'));
+      return;
+    }
     setDraft(createEmptyDraft(type));
     setIsCreating(true);
     setIsEditing(true);
@@ -671,10 +701,23 @@ const folderName = useCallback((id: string | null | undefined): string => {
     if (isMobileLayout) setMobilePanel('edit');
     setMobileSidebarOpen(false);
     if (type === 5) void seedSshDefaults();
-  }, [isMobileLayout]);
+  }, [hasPendingMutation, isMobileLayout, props.onNotify]);
+
+  useEffect(() => {
+    const onQuickAdd = () => {
+      startCreate(1);
+    };
+    window.addEventListener('nodewarden:add-item', onQuickAdd);
+    return () => window.removeEventListener('nodewarden:add-item', onQuickAdd);
+  }, [startCreate]);
 
   const startEdit = useCallback((): void => {
     if (!selectedCipher) return;
+    // D1-105: never open a new editor while a write is still pending.
+    if (hasPendingMutation) {
+      props.onNotify('warning', t('txt_wait_for_pending_write'));
+      return;
+    }
     setDraft(draftFromCipher(selectedCipher));
     setIsCreating(false);
     setIsEditing(true);
@@ -685,9 +728,14 @@ const folderName = useCallback((id: string | null | undefined): string => {
     setRemovedAttachmentIds({});
     if (isMobileLayout) setMobilePanel('edit');
     setMobileSidebarOpen(false);
-  }, [selectedCipher, isMobileLayout]);
+  }, [selectedCipher, isMobileLayout, hasPendingMutation, props.onNotify]);
 
   const cancelEdit = useCallback((): void => {
+    // D1-105: an in-flight save owns the draft; cancelling would drop it.
+    if (isSavingCurrentDraft) {
+      props.onNotify('warning', t('txt_wait_for_pending_write'));
+      return;
+    }
     const returnToDetail = isMobileLayout && !isCreating && !!selectedCipher;
     setDraft(null);
     setIsEditing(false);
@@ -699,7 +747,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
     setRemovedAttachmentIds({});
     setPendingDeletePasskeyIndex(null);
     if (isMobileLayout) setMobilePanel(returnToDetail ? 'detail' : 'list');
-  }, [isMobileLayout, isCreating, selectedCipher]);
+  }, [isMobileLayout, isCreating, selectedCipher, isSavingCurrentDraft, props.onNotify]);
 
   const updateDraft = useCallback((patch: Partial<VaultDraft>): void => {
     setDraft((prev) => (prev ? { ...prev, ...patch } : prev));
@@ -845,7 +893,8 @@ const folderName = useCallback((id: string | null | undefined): string => {
       setLocalError(t('txt_item_changed_elsewhere'));
       return;
     }
-    setBusy(true);
+    const targetId = nextDraft.id || (isCreating ? NEW_CIPHER_WRITE_TARGET : selectedCipherId);
+    setFailedMutation(null);
     try {
       if (isCreating) {
         await props.onCreate(nextDraft, attachmentQueue);
@@ -864,29 +913,28 @@ const folderName = useCallback((id: string | null | undefined): string => {
       setRemovedAttachmentIds({});
       if (isMobileLayout) setMobilePanel('detail');
     } catch {
-      // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
+      // The action layer already shows the user-facing error toast; keep the
+      // draft open and surface a retry hint in the editor.
+      setFailedMutation({ kind: 'save', cipherId: targetId });
     }
   }
 
   async function deleteSelected(): Promise<void> {
     if (!pendingDelete) return;
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onDelete(pendingDelete);
       setPendingDelete(null);
       cancelEdit();
       if (isMobileLayout) setMobilePanel('list');
     } catch {
-      // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
+      // The action layer already shows the user-facing error toast; the
+      // confirmation dialog stays open so the user can retry.
     }
   }
 
   async function handleRestoreSelected(cipher: Cipher): Promise<void> {
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onRestore([cipher.id]);
       if (isMobileLayout && selectedCipherId === cipher.id) {
@@ -894,8 +942,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
       }
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
+      setFailedMutation({ kind: 'restore', cipherId: cipher.id });
     }
   }
 
@@ -904,7 +951,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
       .filter(([, selected]) => selected)
       .map(([id]) => id);
     if (!ids.length) return;
-    setBusy(true);
+    setFailedMutation(null);
     try {
       if (sidebarFilter.kind === 'trash') {
         await props.onBulkPermanentDelete(ids);
@@ -915,8 +962,6 @@ const folderName = useCallback((id: string | null | undefined): string => {
       setBulkDeleteOpen(false);
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -926,26 +971,24 @@ const folderName = useCallback((id: string | null | undefined): string => {
       .map(([id]) => id);
     if (!ids.length) return;
     const folderId = moveFolderId === '__none__' ? null : moveFolderId;
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onBulkMove(ids, folderId);
       setSelectedMap({});
       setMoveOpen(false);
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
     }
   }
 
   async function syncVault(): Promise<void> {
-    setBusy(true);
+    setSyncing(true);
     try {
       await props.onRefresh();
     } catch {
       // The action layer already shows the user-facing error toast.
     } finally {
-      setBusy(false);
+      setSyncing(false);
     }
   }
 
@@ -955,7 +998,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
       props.onNotify('error', t('txt_master_password_is_required_2'));
       return;
     }
-    setBusy(true);
+    setRepromptVerifying(true);
     try {
       await props.onVerifyMasterPassword(props.emailForReprompt, repromptPassword);
       setRepromptApprovedCipherId(selectedCipher.id);
@@ -964,7 +1007,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
     } catch (error) {
       props.onNotify('error', error instanceof Error ? error.message : t('txt_unlock_failed'));
     } finally {
-      setBusy(false);
+      setRepromptVerifying(false);
     }
   }
 
@@ -973,21 +1016,19 @@ const folderName = useCallback((id: string | null | undefined): string => {
       props.onNotify('error', t('txt_folder_name_is_required'));
       return;
     }
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onCreateFolder(newFolderName);
       setCreateFolderOpen(false);
       setNewFolderName('');
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
     }
   }
 
   async function confirmDeleteFolder(): Promise<void> {
     if (!pendingDeleteFolder) return;
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onDeleteFolder(pendingDeleteFolder.id);
       if (sidebarFilter.kind === 'folder' && sidebarFilter.folderId === pendingDeleteFolder.id) {
@@ -995,9 +1036,8 @@ const folderName = useCallback((id: string | null | undefined): string => {
       }
       setPendingDeleteFolder(null);
     } catch {
-      // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
+      // The action layer already shows the user-facing error toast; the
+      // confirmation dialog stays open so the user can retry.
     }
   }
 
@@ -1008,15 +1048,13 @@ const folderName = useCallback((id: string | null | undefined): string => {
       props.onNotify('error', t('txt_folder_name_is_required'));
       return;
     }
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onRenameFolder(pendingRenameFolder.id, nextName);
       setPendingRenameFolder(null);
       setRenameFolderName('');
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -1025,20 +1063,18 @@ const folderName = useCallback((id: string | null | undefined): string => {
       .filter(([, selected]) => selected)
       .map(([id]) => id);
     if (!ids.length) return;
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onBulkRestore(ids);
       setSelectedMap({});
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
     }
   }
 
   async function confirmArchiveSelected(): Promise<void> {
     if (!pendingArchive) return;
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onArchive(pendingArchive);
       setPendingArchive(null);
@@ -1046,14 +1082,13 @@ const folderName = useCallback((id: string | null | undefined): string => {
         setMobilePanel('list');
       }
     } catch {
-      // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
+      // The action layer already shows the user-facing error toast; the
+      // confirmation dialog stays open so the user can retry.
     }
   }
 
   async function handleUnarchiveSelected(cipher: Cipher): Promise<void> {
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onBulkUnarchive([cipher.id]);
       setSelectedMap((prev) => {
@@ -1063,8 +1098,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
       });
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
+      setFailedMutation({ kind: 'unarchive', cipherId: cipher.id });
     }
   }
 
@@ -1073,15 +1107,13 @@ const folderName = useCallback((id: string | null | undefined): string => {
       .filter(([, selected]) => selected)
       .map(([id]) => id);
     if (!ids.length) return;
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onBulkArchive(ids);
       setSelectedMap({});
       setBulkArchiveOpen(false);
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -1090,20 +1122,18 @@ const folderName = useCallback((id: string | null | undefined): string => {
       .filter(([, selected]) => selected)
       .map(([id]) => id);
     if (!ids.length) return;
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onBulkUnarchive(ids);
       setSelectedMap({});
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
     }
   }
 
   async function confirmDeleteAllFolders(): Promise<void> {
     if (!props.folders.length) return;
-    setBusy(true);
+    setFailedMutation(null);
     try {
       await props.onBulkDeleteFolders(props.folders.map((folder) => folder.id));
       if (sidebarFilter.kind === 'folder') {
@@ -1112,9 +1142,15 @@ const folderName = useCallback((id: string | null | undefined): string => {
       setDeleteAllFoldersOpen(false);
     } catch {
       // The action layer already shows the user-facing error toast.
-    } finally {
-      setBusy(false);
     }
+  }
+
+  function retryFailedMutation(): void {
+    if (!failedMutation) return;
+    const cipher = cipherById.get(failedMutation.cipherId);
+    if (!cipher) return;
+    if (failedMutation.kind === 'restore') void handleRestoreSelected(cipher);
+    else if (failedMutation.kind === 'unarchive') void handleUnarchiveSelected(cipher);
   }
 
   const handleClearSearch = useCallback(() => setSearchInput(''), []);
@@ -1182,6 +1218,11 @@ const folderName = useCallback((id: string | null | undefined): string => {
     })
   , []);
   const handleSelectCipher = useCallback((cipherId: string) => {
+    // D1-105: an unfinished save keeps its own selection so the state is not lost.
+    if (isSavingCurrentDraft) {
+      props.onNotify('warning', t('txt_wait_for_pending_write'));
+      return;
+    }
     if (isEditing || isCreating) {
       cancelEdit();
     }
@@ -1191,7 +1232,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
     setHiddenFieldVisibleMap({});
     if (isMobileLayout) setMobilePanel('detail');
     setMobileSidebarOpen(false);
-  }, [isEditing, isCreating, cancelEdit, isMobileLayout]);
+  }, [isEditing, isCreating, cancelEdit, isMobileLayout, isSavingCurrentDraft, props.onNotify]);
   const handleCloseMobileSidebar = useCallback(() => setMobileSidebarOpen(false), []);
   const handleOpenDeleteAllFolders = useCallback(() => setDeleteAllFoldersOpen(true), []);
   const handleOpenCreateFolder = useCallback(() => setCreateFolderOpen(true), []);
@@ -1221,7 +1262,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
         <VaultSidebar
           folders={props.folders}
           sidebarFilter={sidebarFilter}
-          busy={busy}
+          busy={hasPendingMutation}
           isMobileLayout={isMobileLayout}
           mobileSidebarOpen={mobileSidebarOpen}
           folderSortMode={folderSortMode}
@@ -1238,7 +1279,8 @@ const folderName = useCallback((id: string | null | undefined): string => {
         />
 
         <VaultListPanel
-          busy={busy}
+          busy={hasPendingMutation}
+          syncing={syncing}
           loading={props.loading}
           error={props.error}
           folders={props.folders}
@@ -1308,7 +1350,8 @@ const folderName = useCallback((id: string | null | undefined): string => {
               <VaultEditor
                 draft={draft}
                 isCreating={isCreating}
-                busy={busy}
+                busy={isSavingCurrentDraft}
+                saveStatus={saveStatus}
                 folders={props.folders}
                 folderSortMode={folderSortMode}
                 selectedCipher={selectedCipher}
@@ -1348,6 +1391,9 @@ const folderName = useCallback((id: string | null | undefined): string => {
             <div key={`detail-${selectedCipher.id}`} className="detail-switch-stage">
               <VaultDetailView
                 selectedCipher={selectedCipher}
+                pendingCipherId={pendingCipherId}
+                failedCipherId={failedMutation && failedMutation.kind !== 'save' ? failedMutation.cipherId : undefined}
+                onRetry={retryFailedMutation}
                 repromptApprovedCipherId={repromptApprovedCipherId}
                 showPassword={showPassword}
                 totpLive={totpLive}
@@ -1376,7 +1422,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
                 ? (
                   <div className="empty card vault-error-state">
                     <strong>{props.error}</strong>
-                    <button type="button" className="btn btn-secondary small" disabled={busy} onClick={handleSyncVault}>
+                    <button type="button" className="btn btn-secondary small" disabled={syncing} onClick={handleSyncVault}>
                       {t('txt_retry_sync')}
                     </button>
                   </div>
@@ -1387,7 +1433,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
       </div>
 
       <VaultDialogs
-        busy={busy}
+        busy={hasPendingMutation || repromptVerifying}
         fieldModalOpen={fieldModalOpen}
         fieldType={fieldType}
         fieldLabel={fieldLabel}

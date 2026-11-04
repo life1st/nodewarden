@@ -54,6 +54,13 @@ import {
 } from '@/lib/api/vault';
 import { deriveLoginHash, getPreloginKdfConfig, verifyMasterPassword } from '@/lib/api/auth';
 import type { AuthedFetch } from '@/lib/api/shared';
+import {
+  enqueueWrite,
+  NEW_CIPHER_WRITE_TARGET,
+  SEND_WRITE_KEY,
+  VAULT_WRITE_KEY,
+  type WriteJobMeta,
+} from '@/lib/api/write-queue';
 import { downloadBytesAsFile } from '@/lib/download';
 import type { Cipher, Folder as VaultFolder, Profile, Send, SendDraft, SessionState, VaultDraft } from '@/lib/types';
 
@@ -282,6 +289,17 @@ function hasUnresolvedCipherData(cipher: Cipher): boolean {
     ]),
   ];
   return checks.some(([raw, decrypted]) => isEncryptedFieldUnresolved(raw, decrypted));
+}
+
+// Wraps a write action so it runs inside the per-key write queue (D1-102).
+// The queue only orders submissions; it never retries a failed job.
+function queuedWriteAction<A extends unknown[], R>(
+  key: string,
+  meta: WriteJobMeta | ((...args: A) => WriteJobMeta),
+  action: (...args: A) => Promise<R>
+): (...args: A) => Promise<R> {
+  return (...args: A) =>
+    enqueueWrite(key, typeof meta === 'function' ? meta(...args) : meta, () => action(...args));
 }
 
 export default function useVaultSendActions(options: UseVaultSendActionsOptions) {
@@ -523,7 +541,7 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       return { total: attachments.length, imported, failed };
     };
 
-    return {
+    const actions = {
       async refreshVault() {
         await refetchVault();
         onNotify('success', t('txt_vault_synced'));
@@ -1386,6 +1404,100 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       attachmentUploadPercent,
       uploadingSendFileName,
       sendUploadPercent,
+    };
+
+    const saveMeta = (cipherId: string): WriteJobMeta => ({
+      kind: 'save',
+      cipherId,
+      dedupeKey: `save:${cipherId}`,
+    });
+    // Bulk helpers are also used for single-item actions coming from the detail
+    // view; expose the id so the UI can disable just that item's buttons.
+    const singleCipherId = (ids: string[]): string | undefined =>
+      ids.length === 1 ? ids[0] : undefined;
+
+    // D1-102: every non-idempotent write goes through the write queue so a
+    // single tab never submits two writes at the same time.
+    return {
+      ...actions,
+      createVaultItem: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (draft: VaultDraft) => saveMeta(draft.id || NEW_CIPHER_WRITE_TARGET),
+        actions.createVaultItem
+      ),
+      updateVaultItem: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (cipher: Cipher, _draft: VaultDraft, _options?: { addFiles?: File[]; removeAttachmentIds?: string[] }) =>
+          saveMeta(cipher.id),
+        actions.updateVaultItem
+      ),
+      deleteVaultItem: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (cipher: Cipher): WriteJobMeta => ({ kind: 'delete', cipherId: cipher.id }),
+        actions.deleteVaultItem
+      ),
+      archiveVaultItem: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (cipher: Cipher): WriteJobMeta => ({ kind: 'archive', cipherId: cipher.id }),
+        actions.archiveVaultItem
+      ),
+      unarchiveVaultItem: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (cipher: Cipher): WriteJobMeta => ({ kind: 'archive', cipherId: cipher.id }),
+        actions.unarchiveVaultItem
+      ),
+      bulkDeleteVaultItems: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (ids: string[]): WriteJobMeta => ({ kind: 'delete', cipherId: singleCipherId(ids) }),
+        actions.bulkDeleteVaultItems
+      ),
+      bulkPermanentDeleteVaultItems: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (ids: string[]): WriteJobMeta => ({ kind: 'delete', cipherId: singleCipherId(ids) }),
+        actions.bulkPermanentDeleteVaultItems
+      ),
+      bulkRestoreVaultItems: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (ids: string[]): WriteJobMeta => ({ kind: 'restore', cipherId: singleCipherId(ids) }),
+        actions.bulkRestoreVaultItems
+      ),
+      bulkArchiveVaultItems: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (ids: string[]): WriteJobMeta => ({ kind: 'archive', cipherId: singleCipherId(ids) }),
+        actions.bulkArchiveVaultItems
+      ),
+      bulkUnarchiveVaultItems: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (ids: string[]): WriteJobMeta => ({ kind: 'unarchive', cipherId: singleCipherId(ids) }),
+        actions.bulkUnarchiveVaultItems
+      ),
+      bulkMoveVaultItems: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (ids: string[], folderId: string | null): WriteJobMeta => ({
+          kind: 'move',
+          cipherId: singleCipherId(ids),
+          folderId: folderId || undefined,
+        }),
+        actions.bulkMoveVaultItems
+      ),
+      createFolder: queuedWriteAction(VAULT_WRITE_KEY, { kind: 'folder' }, actions.createFolder),
+      deleteFolder: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (folderId: string): WriteJobMeta => ({ kind: 'folder', folderId }),
+        actions.deleteFolder
+      ),
+      renameFolder: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (folderId: string, _name: string): WriteJobMeta => ({ kind: 'folder', folderId }),
+        actions.renameFolder
+      ),
+      bulkDeleteFolders: queuedWriteAction(VAULT_WRITE_KEY, { kind: 'folder' }, actions.bulkDeleteFolders),
+      importVault: queuedWriteAction(VAULT_WRITE_KEY, { kind: 'import' }, actions.importVault),
+      importEncryptedRaw: queuedWriteAction(VAULT_WRITE_KEY, { kind: 'import' }, actions.importEncryptedRaw),
+      createSend: queuedWriteAction(SEND_WRITE_KEY, { kind: 'send' }, actions.createSend),
+      updateSend: queuedWriteAction(SEND_WRITE_KEY, { kind: 'send' }, actions.updateSend),
+      deleteSend: queuedWriteAction(SEND_WRITE_KEY, { kind: 'send' }, actions.deleteSend),
+      bulkDeleteSends: queuedWriteAction(SEND_WRITE_KEY, { kind: 'send' }, actions.bulkDeleteSends),
     };
   }, [
     attachmentDownloadPercent,

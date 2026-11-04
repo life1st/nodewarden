@@ -31,6 +31,7 @@ interface VaultEditorProps {
   draft: VaultDraft;
   isCreating: boolean;
   busy: boolean;
+  saveStatus?: 'queued' | 'running' | 'error' | null;
   folders: Folder[];
   folderSortMode: VaultSortMode;
   selectedCipher: Cipher | null;
@@ -966,6 +967,15 @@ export default function VaultEditor(props: VaultEditorProps) {
           ))}
       </div>
 
+      {props.saveStatus && (
+        <div className={`mutation-status mutation-status-${props.saveStatus}`}>
+          {props.saveStatus === 'queued'
+            ? t('txt_write_queued')
+            : props.saveStatus === 'running'
+              ? t('txt_saving')
+              : t('txt_write_failed_retry')}
+        </div>
+      )}
       <div className="detail-actions">
         <div className="actions">
           <button type="button" className="btn btn-primary" disabled={props.busy} onClick={props.onSave}>
