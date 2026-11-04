@@ -1310,6 +1310,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
                 isCreating={isCreating}
                 busy={busy}
                 folders={props.folders}
+                folderSortMode={folderSortMode}
                 selectedCipher={selectedCipher}
                 loginUsernameSuggestions={loginUsernameSuggestions}
                 editExistingAttachments={editExistingAttachments}

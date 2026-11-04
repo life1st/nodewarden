@@ -2,9 +2,10 @@ import type { RefObject } from 'preact';
 import { createPortal } from 'preact/compat';
 import { ArrowDown, ArrowUp, CheckCheck, Download, Paperclip, Plus, QrCode, RefreshCw, Star, StarOff, Trash2, Upload, WandSparkles, X } from 'lucide-preact';
 import jsQR from 'jsqr';
-import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useDialogLifecycle } from '@/components/ConfirmDialog';
 import PasswordGeneratorModal from '@/components/PasswordGeneratorModal';
+import SearchableSelect from '@/components/SearchableSelect';
 import { normalizeTotpInput } from '@/lib/crypto';
 import { findUsernameCompletion } from '@/lib/username-autocomplete';
 import type { Cipher, Folder, VaultDraft, VaultDraftField } from '@/lib/types';
@@ -15,12 +16,15 @@ import {
   CardBrandIcon,
   cipherTypeLabel,
   createEmptyLoginUri,
+  folderDisplayName,
   formatAttachmentSize,
   formatHistoryTime,
   getCreateTypeOptions,
   getWebsiteMatchOptions,
   normalizeCardBrand,
+  sortFolders,
   toBooleanFieldValue,
+  type VaultSortMode,
 } from '@/components/vault/vault-page-helpers';
 
 interface VaultEditorProps {
@@ -28,6 +32,7 @@ interface VaultEditorProps {
   isCreating: boolean;
   busy: boolean;
   folders: Folder[];
+  folderSortMode: VaultSortMode;
   selectedCipher: Cipher | null;
   loginUsernameSuggestions?: string[];
   editExistingAttachments: Array<any>;
@@ -141,6 +146,16 @@ export default function VaultEditor(props: VaultEditorProps) {
   const cardBrandOptions = normalizedDraftCardBrand && !CARD_BRAND_OPTIONS.includes(normalizedDraftCardBrand as any)
     ? [...CARD_BRAND_OPTIONS, normalizedDraftCardBrand]
     : CARD_BRAND_OPTIONS;
+  const folderOptions = useMemo(
+    () => [
+      { value: '', label: t('txt_no_folder'), pinned: true },
+      ...sortFolders(props.folders, props.folderSortMode).map((folder) => ({
+        value: folder.id,
+        label: folderDisplayName(folder),
+      })),
+    ],
+    [props.folders, props.folderSortMode]
+  );
   const totpQrVideoRef = useRef<HTMLVideoElement | null>(null);
   const totpQrFileRef = useRef<HTMLInputElement | null>(null);
   const totpQrStreamRef = useRef<MediaStream | null>(null);
@@ -515,17 +530,16 @@ export default function VaultEditor(props: VaultEditorProps) {
               ))}
             </select>
           </label>
-          <label className="field">
+          <div className="field">
             <span>{t('txt_folder')}</span>
-            <select className="input" value={props.draft.folderId} onInput={(e) => props.onUpdateDraft({ folderId: (e.currentTarget as HTMLSelectElement).value })}>
-              <option value="">{t('txt_no_folder')}</option>
-              {props.folders.map((folder) => (
-                <option key={folder.id} value={folder.id}>
-                  {folder.decName || folder.name || folder.id}
-                </option>
-              ))}
-            </select>
-          </label>
+            <SearchableSelect
+              value={props.draft.folderId}
+              options={folderOptions}
+              onChange={(folderId) => props.onUpdateDraft({ folderId })}
+              placeholder={t('txt_select')}
+              ariaLabel={t('txt_folder')}
+            />
+          </div>
         </div>
         <label className="field">
           <span>{t('txt_name')}</span>

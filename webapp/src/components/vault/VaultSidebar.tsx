@@ -26,7 +26,7 @@ import {
 import { Link } from 'wouter';
 import type { Folder } from '@/lib/types';
 import { t } from '@/lib/i18n';
-import { getFolderSortOptions, type SidebarFilter, type VaultSortMode } from '@/components/vault/vault-page-helpers';
+import { folderDisplayName, getFolderSortOptions, sortFolders, type SidebarFilter, type VaultSortMode } from '@/components/vault/vault-page-helpers';
 
 interface VaultSidebarProps {
   folders: Folder[];
@@ -49,42 +49,10 @@ interface VaultSidebarProps {
 
 export default function VaultSidebar(props: VaultSidebarProps) {
   const folderSortOptions = getFolderSortOptions();
-  const nameCollator = useMemo(
-    () => new Intl.Collator(undefined, { sensitivity: 'base', numeric: true }),
-    []
+  const sortedFolders = useMemo(
+    () => sortFolders(props.folders, props.folderSortMode),
+    [props.folders, props.folderSortMode]
   );
-  const sortedFolders = useMemo(() => {
-    const sorted = [...props.folders];
-    sorted.sort((a, b) => {
-      if (props.folderSortMode === 'edited') {
-        const aTime = new Date(String(a.revisionDate || a.creationDate || '')).getTime();
-        const bTime = new Date(String(b.revisionDate || b.creationDate || '')).getTime();
-        const aValid = Number.isFinite(aTime);
-        const bValid = Number.isFinite(bTime);
-        if (aValid && bValid) {
-          const diff = bTime - aTime;
-          if (diff !== 0) return diff;
-        }
-        if (aValid !== bValid) return aValid ? -1 : 1;
-      } else if (props.folderSortMode === 'created') {
-        const aTime = new Date(String(a.creationDate || '')).getTime();
-        const bTime = new Date(String(b.creationDate || '')).getTime();
-        const aValid = Number.isFinite(aTime);
-        const bValid = Number.isFinite(bTime);
-        if (aValid && bValid) {
-          const diff = bTime - aTime;
-          if (diff !== 0) return diff;
-        }
-        if (aValid !== bValid) return aValid ? -1 : 1;
-      }
-      const nameDiff = nameCollator.compare(
-        String(a.decName || a.name || ''), String(b.decName || b.name || '')
-      );
-      if (nameDiff !== 0) return nameDiff;
-      return String(a.id || '').localeCompare(String(b.id || ''));
-    });
-    return sorted;
-  }, [props.folders, props.folderSortMode, nameCollator]);
 
   return (
     <aside className={`sidebar ${props.isMobileLayout ? 'mobile-sidebar-sheet' : ''} ${props.isMobileLayout && props.mobileSidebarOpen ? 'open' : ''}`}>
@@ -201,8 +169,8 @@ export default function VaultSidebar(props: VaultSidebarProps) {
               onClick={() => props.onChangeFilter({ kind: 'folder', folderId: folder.id })}
             >
               <FolderIcon size={14} className="tree-icon" />
-              <span className="tree-label" title={folder.decName || folder.name || folder.id}>
-                {folder.decName || folder.name || folder.id}
+              <span className="tree-label" title={folderDisplayName(folder)}>
+                {folderDisplayName(folder)}
               </span>
             </button>
             <button

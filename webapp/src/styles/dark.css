@@ -117,6 +117,20 @@
   color: color-mix(in srgb, var(--muted) 62%, transparent);
 }
 
+:root[data-theme='dark'] .searchable-select-toggle {
+  color: var(--muted);
+}
+
+:root[data-theme='dark'] .searchable-select-toggle:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel-muted);
+}
+
+:root[data-theme='dark'] .searchable-select-option:hover,
+:root[data-theme='dark'] .searchable-select-option.active {
+  background: var(--panel-muted);
+}
+
 :root[data-theme='dark'] .mobile-sidebar-mask,
 :root[data-theme='dark'] .dialog-mask {
   background: var(--overlay-strong);

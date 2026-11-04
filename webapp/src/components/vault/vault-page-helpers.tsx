@@ -13,7 +13,7 @@ import {
 } from 'lucide-preact';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { t } from '@/lib/i18n';
-import type { Cipher, CipherAttachment, CustomFieldType, VaultDraft, VaultDraftField, VaultDraftLoginUri } from '@/lib/types';
+import type { Cipher, CipherAttachment, CustomFieldType, Folder, VaultDraft, VaultDraftField, VaultDraftLoginUri } from '@/lib/types';
 import { firstCipherUri, hostFromUri, websiteIconUrl } from '@/lib/website-utils';
 import { normalizeEquivalentDomain } from '@shared/domain-normalize';
 import WebsiteIcon from './WebsiteIcon';
@@ -186,6 +186,45 @@ export function getFolderSortOptions(): Array<{ value: VaultSortMode; label: str
     { value: 'created', label: t('txt_sort_created') },
     { value: 'name', label: t('txt_sort_name') },
   ];
+}
+
+const folderNameCollator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+
+export function folderDisplayName(folder: Folder): string {
+  return folder.decName || folder.name || folder.id;
+}
+
+export function sortFolders(folders: Folder[], mode: VaultSortMode): Folder[] {
+  const sorted = [...folders];
+  sorted.sort((a, b) => {
+    if (mode === 'edited') {
+      const aTime = new Date(String(a.revisionDate || a.creationDate || '')).getTime();
+      const bTime = new Date(String(b.revisionDate || b.creationDate || '')).getTime();
+      const aValid = Number.isFinite(aTime);
+      const bValid = Number.isFinite(bTime);
+      if (aValid && bValid) {
+        const diff = bTime - aTime;
+        if (diff !== 0) return diff;
+      }
+      if (aValid !== bValid) return aValid ? -1 : 1;
+    } else if (mode === 'created') {
+      const aTime = new Date(String(a.creationDate || '')).getTime();
+      const bTime = new Date(String(b.creationDate || '')).getTime();
+      const aValid = Number.isFinite(aTime);
+      const bValid = Number.isFinite(bTime);
+      if (aValid && bValid) {
+        const diff = bTime - aTime;
+        if (diff !== 0) return diff;
+      }
+      if (aValid !== bValid) return aValid ? -1 : 1;
+    }
+    const nameDiff = folderNameCollator.compare(
+      String(a.decName || a.name || ''), String(b.decName || b.name || '')
+    );
+    if (nameDiff !== 0) return nameDiff;
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
+  return sorted;
 }
 
 export function getFieldTypeOptions(): Array<{ value: CustomFieldType; label: string }> {

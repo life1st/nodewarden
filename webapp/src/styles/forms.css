@@ -74,6 +74,90 @@ input[type='file'].input::file-selector-button:hover {
   @apply cursor-not-allowed border-slate-300 bg-slate-200 text-slate-400;
 }
 
+.searchable-select {
+  @apply relative w-full;
+}
+
+.searchable-select input.searchable-select-input {
+  @apply pr-10;
+}
+
+.searchable-select-toggle {
+  @apply absolute right-2.5 top-1/2 grid h-7 w-7 cursor-pointer place-items-center rounded-full border-0 bg-transparent p-0 text-slate-500;
+  transform: translateY(-50%);
+  transition:
+    color var(--dur-fast) var(--ease-smooth),
+    background-color var(--dur-fast) var(--ease-smooth),
+    transform var(--dur-fast) var(--ease-out-soft);
+}
+
+.searchable-select-toggle:hover:not(:disabled) {
+  color: var(--primary);
+  background: rgba(37, 99, 235, 0.08);
+}
+
+.searchable-select-toggle:disabled {
+  @apply cursor-not-allowed text-slate-400;
+}
+
+.searchable-select-toggle svg {
+  transition: transform var(--dur-fast) var(--ease-smooth);
+}
+
+.searchable-select-toggle.open svg {
+  transform: rotate(180deg);
+}
+
+.searchable-select-menu {
+  @apply fixed z-[1300] overflow-auto rounded-2xl border p-1.5;
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: var(--shadow-md);
+  overscroll-behavior: contain;
+  transform-origin: top left;
+  animation: menu-in 190ms var(--ease-out-strong) both;
+}
+
+.searchable-select-option {
+  @apply flex w-full cursor-pointer items-center justify-between gap-2.5 rounded-[10px] border-0 bg-transparent px-2.5 py-[9px] text-left text-[13px];
+  border: none;
+  color: var(--text);
+  transition:
+    background-color var(--dur-fast) var(--ease-smooth),
+    color var(--dur-fast) var(--ease-smooth);
+}
+
+.searchable-select-option:hover,
+.searchable-select-option.active {
+  background: color-mix(in srgb, var(--primary) 9%, var(--panel));
+}
+
+.searchable-select-option.selected {
+  color: var(--primary-strong);
+  font-weight: 700;
+}
+
+.searchable-select-option:disabled {
+  @apply cursor-not-allowed opacity-45;
+}
+
+.searchable-select-option-label {
+  @apply min-w-0 overflow-hidden text-ellipsis whitespace-nowrap;
+}
+
+.searchable-select-check {
+  @apply shrink-0;
+}
+
+.searchable-select-check-placeholder {
+  @apply h-3.5 w-3.5 shrink-0;
+}
+
+.searchable-select-empty {
+  @apply px-2.5 py-3 text-center text-[13px];
+  color: var(--muted);
+}
+
 .password-wrap {
   @apply relative;
 }
