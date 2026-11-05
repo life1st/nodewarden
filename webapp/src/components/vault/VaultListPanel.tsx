@@ -1,5 +1,5 @@
 import type { ComponentChildren, RefObject } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { createPortal } from 'preact/compat';
 import {
@@ -10,9 +10,7 @@ import {
   ChevronDown,
   Copy,
   CreditCard,
-  Folder as FolderIcon,
   FolderInput,
-  FolderX,
   Globe,
   KeyRound,
   LayoutGrid,
@@ -26,15 +24,18 @@ import {
   X,
 } from 'lucide-preact';
 import LoadingState from '@/components/LoadingState';
+import SearchableSelect from '@/components/SearchableSelect';
 import type { Cipher, Folder } from '@/lib/types';
 import { t } from '@/lib/i18n';
 import type { MutationKind, MutationPhase } from '@/lib/api/write-queue';
 import {
   CreateTypeIcon,
+  folderSelectOption,
   getCreateTypeOptions,
   getDuplicateDetectionOptions,
   getVaultSortOptions,
   mutationActionLabel,
+  sortFolders,
   VaultListIcon,
   type DuplicateDetectionMode,
   type SidebarFilter,
@@ -57,6 +58,7 @@ interface VaultListPanelProps {
   loading: boolean;
   error: string;
   folders: Folder[];
+  folderSortMode: VaultSortMode;
   searchInput: string;
   sortMode: VaultSortMode;
   sortMenuOpen: boolean;
@@ -112,11 +114,11 @@ interface CipherListItemProps {
   onSelectCipher: (cipherId: string) => void;
 }
 
-type MobileFilterMenuKey = 'duplicate' | 'menu' | 'type' | 'folder';
+type MobileFilterMenuKey = 'duplicate' | 'menu' | 'type';
 
 interface MobileFilterOption {
   value: string;
-  label: string;
+  label: ComponentChildren;
   icon: ComponentChildren;
   active: boolean;
   onSelect: () => void;
@@ -183,19 +185,19 @@ export default function VaultListPanel(props: VaultListPanelProps) {
     { value: 'note', label: t('txt_note'), icon: <StickyNote size={14} />, active: props.sidebarFilter.kind === 'type' && props.sidebarFilter.value === 'note', onSelect: () => props.onChangeFilter({ kind: 'type', value: 'note' }) },
     { value: 'ssh', label: t('txt_ssh_key'), icon: <KeyRound size={14} />, active: props.sidebarFilter.kind === 'type' && props.sidebarFilter.value === 'ssh', onSelect: () => props.onChangeFilter({ kind: 'type', value: 'ssh' }) },
   ];
-  const folderMobileFilterOptions: MobileFilterOption[] = [
-    { value: '__none__', label: t('txt_no_folder'), icon: <FolderX size={14} />, active: props.sidebarFilter.kind === 'folder' && props.sidebarFilter.folderId === null, onSelect: () => props.onChangeFilter({ kind: 'folder', folderId: null }) },
-    ...props.folders.map((folder) => ({
-      value: folder.id,
-      label: folder.decName || folder.name || folder.id,
-      icon: <FolderIcon size={14} />,
-      active: props.sidebarFilter.kind === 'folder' && props.sidebarFilter.folderId === folder.id,
-      onSelect: () => props.onChangeFilter({ kind: 'folder', folderId: folder.id }),
-    })),
-  ];
+  const folderSelectOptions = useMemo(
+    () => [
+      { value: '__none__', label: t('txt_no_folder'), pinned: true },
+      ...sortFolders(props.folders, props.folderSortMode).map(folderSelectOption),
+    ],
+    [props.folders, props.folderSortMode]
+  );
+  const folderSelectValue = props.sidebarFilter.kind === 'folder' ? (props.sidebarFilter.folderId || '__none__') : '';
+  const handleFolderSelect = (value: string) => {
+    props.onChangeFilter({ kind: 'folder', folderId: value === '__none__' ? null : value });
+  };
   const menuFilterSelected = menuFilterOptions.find((option) => option.active);
   const typeFilterSelected = typeMobileFilterOptions.find((option) => option.active);
-  const folderFilterSelected = folderMobileFilterOptions.find((option) => option.active);
   const duplicateModeSelected = duplicateModeOptions.find((option) => option.active);
 
   useEffect(() => {
@@ -411,7 +413,15 @@ export default function VaultListPanel(props: VaultListPanelProps) {
           <div className="mobile-vault-filter-row" aria-label={t('txt_filter')}>
             {renderMobileFilterMenu('menu', t('txt_menu'), menuFilterSelected, <LayoutGrid size={14} />, menuFilterOptions)}
             {renderMobileFilterMenu('type', t('txt_type'), typeFilterSelected, <Globe size={14} />, typeMobileFilterOptions)}
-            {renderMobileFilterMenu('folder', t('txt_folder'), folderFilterSelected, <FolderIcon size={14} />, folderMobileFilterOptions)}
+            <div className="mobile-vault-filter-control">
+              <SearchableSelect
+                value={folderSelectValue}
+                options={folderSelectOptions}
+                onChange={handleFolderSelect}
+                placeholder={t('txt_folder')}
+                ariaLabel={t('txt_folder')}
+              />
+            </div>
           </div>
         )}
       </div>

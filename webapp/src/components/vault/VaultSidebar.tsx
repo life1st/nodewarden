@@ -26,7 +26,7 @@ import {
 import { Link } from 'wouter';
 import type { Folder } from '@/lib/types';
 import { t } from '@/lib/i18n';
-import { folderDisplayName, getFolderSortOptions, sortFolders, type SidebarFilter, type VaultSortMode } from '@/components/vault/vault-page-helpers';
+import { folderDisplayName, getFolderSortOptions, sortFolders, splitFolderLabel, type SidebarFilter, type VaultSortMode } from '@/components/vault/vault-page-helpers';
 
 interface VaultSidebarProps {
   folders: Folder[];
@@ -161,48 +161,53 @@ export default function VaultSidebar(props: VaultSidebarProps) {
         <button type="button" className={`tree-btn ${props.sidebarFilter.kind === 'folder' && props.sidebarFilter.folderId === null ? 'active' : ''}`} onClick={() => props.onChangeFilter({ kind: 'folder', folderId: null })}>
           <FolderX size={14} className="tree-icon" /> <span className="tree-label">{t('txt_no_folder')}</span>
         </button>
-        {sortedFolders.map((folder) => (
-          <div key={folder.id} className="folder-row">
-            <button
-              type="button"
-              className={`tree-btn ${props.sidebarFilter.kind === 'folder' && props.sidebarFilter.folderId === folder.id ? 'active' : ''}`}
-              onClick={() => props.onChangeFilter({ kind: 'folder', folderId: folder.id })}
-            >
-              <FolderIcon size={14} className="tree-icon" />
-              <span className="tree-label" title={folderDisplayName(folder)}>
-                {folderDisplayName(folder)}
-              </span>
-            </button>
-            <button
-              type="button"
-              className="folder-delete-btn folder-edit-btn"
-              title={t('txt_edit')}
-              aria-label={t('txt_edit')}
-              disabled={props.busy}
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                props.onOpenRenameFolder(folder);
-              }}
-            >
-              <Pencil size={12} />
-            </button>
-            <button
-              type="button"
-              className="folder-delete-btn"
-              title={t('txt_delete')}
-              aria-label={t('txt_delete')}
-              disabled={props.busy}
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                props.onOpenDeleteFolder(folder);
-              }}
-            >
-              <X size={12} />
-            </button>
-          </div>
-        ))}
+        {sortedFolders.map((folder) => {
+          const label = folderDisplayName(folder);
+          const parts = splitFolderLabel(label);
+          return (
+            <div key={folder.id} className="folder-row">
+              <button
+                type="button"
+                className={`tree-btn ${props.sidebarFilter.kind === 'folder' && props.sidebarFilter.folderId === folder.id ? 'active' : ''}`}
+                onClick={() => props.onChangeFilter({ kind: 'folder', folderId: folder.id })}
+              >
+                <FolderIcon size={14} className="tree-icon" />
+                <span className="tree-label" title={label}>
+                  {parts ? <span className="folder-prefix">{parts.prefix}</span> : null}
+                  {parts ? parts.leaf : label}
+                </span>
+              </button>
+              <button
+                type="button"
+                className="folder-delete-btn folder-edit-btn"
+                title={t('txt_edit')}
+                aria-label={t('txt_edit')}
+                disabled={props.busy}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  props.onOpenRenameFolder(folder);
+                }}
+              >
+                <Pencil size={12} />
+              </button>
+              <button
+                type="button"
+                className="folder-delete-btn"
+                title={t('txt_delete')}
+                aria-label={t('txt_delete')}
+                disabled={props.busy}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  props.onOpenDeleteFolder(folder);
+                }}
+              >
+                <X size={12} />
+              </button>
+            </div>
+          );
+        })}
       </div>
     </aside>
   );

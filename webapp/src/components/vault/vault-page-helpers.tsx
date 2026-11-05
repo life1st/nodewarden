@@ -195,6 +195,32 @@ export function folderDisplayName(folder: Folder): string {
   return folder.decName || folder.name || folder.id;
 }
 
+export interface FolderLabelParts {
+  prefix: string;
+  leaf: string;
+}
+
+export function splitFolderLabel(label: string): FolderLabelParts | null {
+  const index = label.lastIndexOf('/');
+  if (index <= 0) return null;
+  const prefix = label.slice(0, index + 1);
+  const leaf = label.slice(index + 1);
+  if (!leaf) return null;
+  return { prefix, leaf };
+}
+
+export interface FolderSelectOption {
+  value: string;
+  label: string;
+  prefix?: string;
+}
+
+export function folderSelectOption(folder: Folder): FolderSelectOption {
+  const label = folderDisplayName(folder);
+  const prefix = splitFolderLabel(label)?.prefix;
+  return prefix ? { value: folder.id, label, prefix } : { value: folder.id, label };
+}
+
 export function sortFolders(folders: Folder[], mode: VaultSortMode): Folder[] {
   const sorted = [...folders];
   sorted.sort((a, b) => {

@@ -125,6 +125,12 @@
   @apply min-w-0 overflow-hidden text-ellipsis whitespace-nowrap;
 }
 
+.folder-prefix {
+  padding-left: var(--space-2);
+  font-size: var(--font-xs);
+  color: color-mix(in srgb, var(--muted) 72%, transparent);
+}
+
 .folder-row {
   @apply flex items-center gap-1.5;
 }
@@ -327,6 +333,11 @@ select.input.duplicate-mode-toolbar-select {
 .mobile-vault-filter-menu {
   @apply left-0 right-auto max-h-[280px] min-w-full overflow-auto;
   min-width: max(100%, 168px);
+}
+
+.mobile-vault-filter-control .searchable-select input.searchable-select-input {
+  @apply h-[34px] rounded-[10px] px-3 py-0 pr-10 text-[13px] font-semibold;
+  line-height: 34px;
 }
 
 .mobile-vault-filter-control:last-child .mobile-vault-filter-menu {

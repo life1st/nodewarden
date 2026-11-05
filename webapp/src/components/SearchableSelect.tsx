@@ -7,6 +7,7 @@ import { findInlineCompletion } from '@/lib/username-autocomplete';
 export interface SearchableSelectOption {
   value: string;
   label: string;
+  prefix?: string;
   pinned?: boolean;
   disabled?: boolean;
 }
@@ -456,7 +457,16 @@ export default function SearchableSelect(props: SearchableSelectProps) {
                 }}
                 onClick={() => selectOption(option)}
               >
-                <span className="searchable-select-option-label">{option.label}</span>
+                <span className="searchable-select-option-label">
+                  {option.prefix && option.label.startsWith(option.prefix) ? (
+                    <>
+                      <span className="folder-prefix">{option.prefix}</span>
+                      {option.label.slice(option.prefix.length)}
+                    </>
+                  ) : (
+                    option.label
+                  )}
+                </span>
                 {option.value === props.value
                   ? <Check size={14} className="searchable-select-check" />
                   : <span className="searchable-select-check-placeholder" />}

@@ -2,7 +2,7 @@ import { useMemo } from 'preact/hooks';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import SearchableSelect from '@/components/SearchableSelect';
 import type { CustomFieldType, Folder } from '@/lib/types';
-import { folderDisplayName, getFieldTypeOptions, mutationActionLabel, sortFolders, toBooleanFieldValue, type VaultSortMode } from '@/components/vault/vault-page-helpers';
+import { folderSelectOption, getFieldTypeOptions, mutationActionLabel, sortFolders, toBooleanFieldValue, type VaultSortMode } from '@/components/vault/vault-page-helpers';
 import type { MutationKind, MutationPhase } from '@/lib/api/write-queue';
 import { t } from '@/lib/i18n';
 
@@ -75,10 +75,7 @@ export default function VaultDialogs(props: VaultDialogsProps) {
   const confirmLabel = (kind: MutationKind, fallback: string): string =>
     mutationActionLabel(kind, props.mutationPhaseFor(kind), fallback);
   const moveFolderOptions = useMemo(
-    () => sortFolders(props.folders, props.folderSortMode).map((folder) => ({
-      value: folder.id,
-      label: folderDisplayName(folder),
-    })),
+    () => sortFolders(props.folders, props.folderSortMode).map(folderSelectOption),
     [props.folders, props.folderSortMode]
   );
   return (

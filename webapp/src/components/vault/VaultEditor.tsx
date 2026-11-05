@@ -16,7 +16,7 @@ import {
   CardBrandIcon,
   cipherTypeLabel,
   createEmptyLoginUri,
-  folderDisplayName,
+  folderSelectOption,
   formatAttachmentSize,
   formatHistoryTime,
   getCreateTypeOptions,
@@ -150,10 +150,7 @@ export default function VaultEditor(props: VaultEditorProps) {
   const folderOptions = useMemo(
     () => [
       { value: '', label: t('txt_no_folder'), pinned: true },
-      ...sortFolders(props.folders, props.folderSortMode).map((folder) => ({
-        value: folder.id,
-        label: folderDisplayName(folder),
-      })),
+      ...sortFolders(props.folders, props.folderSortMode).map(folderSelectOption),
     ],
     [props.folders, props.folderSortMode]
   );

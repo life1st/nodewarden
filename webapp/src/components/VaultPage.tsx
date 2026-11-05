@@ -1284,6 +1284,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
           loading={props.loading}
           error={props.error}
           folders={props.folders}
+          folderSortMode={folderSortMode}
           searchInput={searchInput}
           sortMode={sortMode}
           sortMenuOpen={sortMenuOpen}
