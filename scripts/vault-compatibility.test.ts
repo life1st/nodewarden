@@ -4,9 +4,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { StorageService } from '../src/services/storage';
 import { handleAuthenticatedRoute } from '../src/router-authenticated';
 import { cipherToResponse } from '../src/handlers/ciphers';
+import { ensureUserRevisionSchema } from '../src/services/storage-schema';
+import { getRevisionMs, updateRevisionDate } from '../src/services/storage-revision-repo';
 import { bytesToBase64, encryptBw, decryptStr } from '../webapp/src/lib/crypto';
 import { decryptSingleCipher } from '../webapp/src/lib/decrypt-cipher';
 import { updateCipher, buildCipherImportPayload, repairCipherKeyMismatches } from '../webapp/src/lib/api/vault';
+import { isCurrentRevision } from '../webapp/src/lib/api/vault-sync';
 import { importCipherToDraft } from '../webapp/src/lib/app-support';
 import { draftFromCipher } from '../webapp/src/components/vault/vault-page-helpers';
 import { t as translate } from '../webapp/src/lib/i18n';
@@ -35,7 +38,10 @@ async function fixture(ctx: TestContext) {
     CREATE TABLE attachments(id TEXT PRIMARY KEY, cipher_id TEXT,
       file_name TEXT, size INTEGER, size_name TEXT, key TEXT);
     CREATE TABLE devices(user_id TEXT, push_token TEXT);
-    CREATE TABLE user_revisions(user_id TEXT PRIMARY KEY, revision_date TEXT);
+    CREATE TABLE user_revisions(user_id TEXT PRIMARY KEY, revision_date TEXT NOT NULL,
+      revision_ms INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE folders(id TEXT PRIMARY KEY, user_id TEXT, name TEXT,
+      created_at TEXT, updated_at TEXT);
   `);
   // One counter per executed statement/batch: a D1 round trip is a run(), all(),
   // first() or batch() call. Statements handed to batch() are prepared here but
@@ -207,7 +213,7 @@ test('a write conflict detected after reading leaves attachment metadata untouch
   assert.equal((await f.route(`/api/ciphers/${id}`, 'PUT', {
     name: await encrypt('Stale title'), lastKnownRevisionDate: revision,
     attachments2: { [attachmentId]: { fileName: await encrypt('Stale file') } },
-  })).status, 400);
+  })).status, 409);
   assert.equal((await f.storage.getAttachment(attachmentId))?.fileName, f.attachment.fileName);
   assert.equal(f.notifications.length, 0);
   // The conditional batch lost, so the user revision must not move either.
@@ -303,7 +309,14 @@ test('concurrent saves from the same revision accept only one, even in the same 
   const response = await Promise.all(['First title', 'Second title'].map(async (title) =>
     f.route(`/api/ciphers/${id}`, 'PUT', { name: await encrypt(title), lastKnownRevisionDate: revision })
   ));
-  assert.deepEqual(response.map((r) => r.status).sort(), [200, 400]);
+  const statuses = response.map((r) => r.status).sort((a, b) => a - b);
+  assert.equal(statuses[0], 200, 'exactly one concurrent save wins');
+  // The loser is reported either by the client revision check (400) or by the
+  // conditional update (409) depending on interleaving - never as success.
+  assert.ok(
+    statuses[1] === 400 || statuses[1] === 409,
+    `the losing save must report a conflict, got ${statuses[1]}`
+  );
   assert.equal((await f.storage.getCipherForUser(id, owner))?.updatedAt, '2026-10-04T00:00:00.001Z');
 });
 
@@ -315,7 +328,7 @@ test('a competing deletion cannot be resurrected by a delayed update', async (ct
     await f.storage.deleteCipher(id, owner);
     return result;
   });
-  assert.equal((await f.route(`/api/ciphers/${id}`, 'PUT', { name: await encrypt('Delayed title') })).status, 400);
+  assert.equal((await f.route(`/api/ciphers/${id}`, 'PUT', { name: await encrypt('Delayed title') })).status, 409);
   assert.equal(await f.storage.getCipher(id), null);
 });
 
@@ -444,4 +457,245 @@ test('automatic item-key repair preserves linked metadata and the intentional re
   assert.equal(await decryptStr(saved.name, itemEnc, itemMac), 'Initial title');
   assert.equal(await decryptStr(saved.fields![0].name!, itemEnc, itemMac), 'Linked username');
   assert.equal('lastKnownRevisionDate' in saved, false);
+});
+
+// --- D1-301 / D1-302 / D1-303: optimistic concurrency and version control ---
+
+// Minimal D1 wrapper for schema-only statements (the migration test does not
+// need round-trip counting or batch transactions).
+function createSchemaD1Mock(sqlite: DatabaseSync): any {
+  return {
+    prepare(sql: string) {
+      let values: any[] = [];
+      const statement = {
+        bind(...bound: any[]) {
+          values = bound;
+          return statement;
+        },
+        async run() {
+          sqlite.prepare(sql).run(...values);
+          return { success: true, meta: { changes: 0 } };
+        },
+        async all() {
+          return { success: true, results: sqlite.prepare(sql).all(...values) };
+        },
+        async first() {
+          return sqlite.prepare(sql).get(...values) ?? null;
+        },
+      };
+      return statement;
+    },
+  };
+}
+
+async function createTestFolder(f: Awaited<ReturnType<typeof fixture>>, name: string): Promise<string> {
+  const created: any = await (await f.route('/api/folders', 'POST', { name: await encrypt(name) })).json();
+  assert.ok(created.id, 'folder creation returns the new id');
+  return String(created.id);
+}
+
+function readCipherColumns(f: Awaited<ReturnType<typeof fixture>>, columnList: string): any {
+  return f.sqlite.prepare(`SELECT ${columnList} FROM ciphers WHERE id = ?`).get(id);
+}
+
+test('a partial update and an archive on one cipher cannot both win', async (ctx) => {
+  const f = await fixture(ctx);
+  const snapshot = { ...(await f.storage.getCipherForUser(id, owner))! };
+  // Both requests observe the same version, as they would when racing.
+  ctx.mock.method(StorageService.prototype, 'getCipherForUser', async function (this: StorageService) {
+    return { ...snapshot };
+  });
+
+  const partial = await f.route(`/api/ciphers/${id}/partial`, 'PUT', { favorite: true });
+  const notificationsAfterWinner = f.notifications.length;
+  const archive = await f.route(`/api/ciphers/${id}/archive`, 'PUT');
+
+  assert.equal(partial.status, 200);
+  assert.equal(archive.status, 409, 'the losing write reports a version conflict');
+  const row = readCipherColumns(f, 'favorite, archived_at');
+  assert.equal(row.favorite, 1, "the winner's change survives");
+  assert.equal(row.archived_at, null, 'the loser does not archive the item');
+  assert.equal(f.notifications.length, notificationsAfterWinner, 'a lost write sends no notifications');
+});
+
+test('a stale partial update cannot resurrect a concurrently deleted cipher', async (ctx) => {
+  const f = await fixture(ctx);
+  assert.equal((await f.route(`/api/ciphers/${id}`, 'DELETE')).status, 200);
+  const snapshot = { ...(await f.storage.getCipherForUser(id, owner))! };
+  snapshot.deletedAt = null;
+  snapshot.updatedAt = revision;
+  ctx.mock.method(StorageService.prototype, 'getCipherForUser', async function (this: StorageService) {
+    return { ...snapshot };
+  });
+
+  const partial = await f.route(`/api/ciphers/${id}/partial`, 'PUT', { favorite: true });
+  assert.equal(partial.status, 409);
+  const row = readCipherColumns(f, 'deleted_at, favorite');
+  assert.ok(row.deleted_at, 'the item stays deleted');
+  assert.equal(row.favorite, 0, 'the stale write is discarded');
+});
+
+test('a permanent delete loses against a newer version and touches nothing', async (ctx) => {
+  const f = await fixture(ctx);
+  await f.storage.saveAttachment(f.attachment);
+  const snapshot = { ...(await f.storage.getCipherForUser(id, owner))! };
+  // Another request saves a new version while this one prepares to purge.
+  await f.storage.saveCipher({ ...snapshot, favorite: true, updatedAt: '2026-10-04T00:00:01.000Z' });
+  ctx.mock.method(StorageService.prototype, 'getCipherForUser', async function (this: StorageService) {
+    return { ...snapshot };
+  });
+
+  const response = await f.route(`/api/ciphers/${id}/delete`, 'DELETE');
+  assert.equal(response.status, 409);
+  assert.ok(f.sqlite.prepare('SELECT id FROM ciphers WHERE id = ?').get(id), 'the cipher survives');
+  assert.equal(readCipherColumns(f, 'favorite').favorite, 1, "the concurrent save isn't destroyed");
+  assert.ok(await f.storage.getAttachment(attachmentId), 'attachment rows are untouched');
+  assert.deepEqual(f.deletedBlobs, [], 'no attachment blob is removed on a lost delete');
+});
+
+test('concurrent folder renames keep only the first write', async (ctx) => {
+  const f = await fixture(ctx);
+  const newFolderId = await createTestFolder(f, 'Work');
+  const snapshot = (await f.storage.getFolderForUser(newFolderId, owner))!;
+  ctx.mock.method(StorageService.prototype, 'getFolderForUser', async function (this: StorageService) {
+    return { ...snapshot };
+  });
+
+  const winnerName = await encrypt('First');
+  const first = await f.route(`/api/folders/${newFolderId}`, 'PUT', { name: winnerName });
+  const second = await f.route(`/api/folders/${newFolderId}`, 'PUT', { name: await encrypt('Second') });
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 409, 'the losing rename reports a version conflict');
+  const row = f.sqlite.prepare('SELECT name, updated_at FROM folders WHERE id = ?').get(newFolderId) as any;
+  assert.equal(row.name, winnerName, "the winner's name survives");
+  assert.notEqual(row.updated_at, snapshot.updatedAt, 'the winner advances the folder version');
+});
+
+test('folder delete clears references and the folder in one guarded batch', async (ctx) => {
+  const f = await fixture(ctx);
+  const newFolderId = await createTestFolder(f, 'Work');
+  assert.equal((await f.route(`/api/ciphers/${id}/partial`, 'PUT', { folderId: newFolderId })).status, 200);
+  const beforeDelete = readCipherColumns(f, 'updated_at').updated_at;
+
+  const before = f.roundTrips();
+  assert.equal((await f.route(`/api/folders/${newFolderId}`, 'DELETE')).status, 204);
+  const used = f.roundTrips() - before;
+  assert.ok(used <= 2, `folder delete should read the folder and run one batch, got ${used}`);
+
+  const row = readCipherColumns(f, 'folder_id, updated_at');
+  assert.equal(row.folder_id, null, 'cipher references are cleared');
+  assert.notEqual(row.updated_at, beforeDelete, 'the touched cipher reports a new version');
+  assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM folders WHERE id = ?').get(newFolderId).n, 0);
+});
+
+test('a write that raced with a folder delete cannot restore the cleared reference', async (ctx) => {
+  const f = await fixture(ctx);
+  const newFolderId = await createTestFolder(f, 'Work');
+  assert.equal((await f.route(`/api/ciphers/${id}/partial`, 'PUT', { folderId: newFolderId })).status, 200);
+  const cipherSnapshot = { ...(await f.storage.getCipherForUser(id, owner))! };
+  const folderSnapshot = (await f.storage.getFolderForUser(newFolderId, owner))!;
+  assert.equal((await f.route(`/api/folders/${newFolderId}`, 'DELETE')).status, 204);
+
+  // Both reads below happened before the folder delete landed.
+  ctx.mock.method(StorageService.prototype, 'getCipherForUser', async function (this: StorageService) {
+    return { ...cipherSnapshot };
+  });
+  ctx.mock.method(StorageService.prototype, 'getFolderForUser', async function (this: StorageService) {
+    return { ...folderSnapshot };
+  });
+
+  const staleWrite = await f.route(`/api/ciphers/${id}/partial`, 'PUT', { folderId: newFolderId, favorite: true });
+  assert.equal(staleWrite.status, 409, 'the reference cleanup bumped the cipher past this version');
+  const row = readCipherColumns(f, 'folder_id, favorite');
+  assert.equal(row.folder_id, null, 'no dangling folder reference is restored');
+  assert.equal(row.favorite, 0, 'the stale write is discarded');
+});
+
+test('a folder modified since the read is not deleted and keeps its references', async (ctx) => {
+  const f = await fixture(ctx);
+  const newFolderId = await createTestFolder(f, 'Work');
+  assert.equal((await f.route(`/api/ciphers/${id}/partial`, 'PUT', { folderId: newFolderId })).status, 200);
+  const snapshot = (await f.storage.getFolderForUser(newFolderId, owner))!;
+  const winnerName = await encrypt('Renamed');
+  await f.storage.saveFolder({ ...snapshot, name: winnerName, updatedAt: '2026-10-04T00:00:01.000Z' });
+  ctx.mock.method(StorageService.prototype, 'getFolderForUser', async function (this: StorageService) {
+    return { ...snapshot };
+  });
+
+  const response = await f.route(`/api/folders/${newFolderId}`, 'DELETE');
+  assert.equal(response.status, 409);
+  const folderRow = f.sqlite.prepare('SELECT name FROM folders WHERE id = ?').get(newFolderId) as any;
+  assert.ok(folderRow, 'the folder survives a lost delete');
+  assert.equal(folderRow.name, winnerName, "the concurrent rename isn't destroyed");
+  assert.equal(
+    readCipherColumns(f, 'folder_id').folder_id,
+    newFolderId,
+    'references are not cleared when the delete loses'
+  );
+});
+
+test('revision stamps stay strictly increasing when the clock freezes or rewinds', async (ctx) => {
+  const f = await fixture(ctx);
+  const frozen = Date.parse(revision);
+  let nowMs = frozen;
+  ctx.mock.method(Date, 'now', () => nowMs);
+
+  const first = await updateRevisionDate(f.env.DB, owner);
+  const second = await updateRevisionDate(f.env.DB, owner);
+  assert.notEqual(first, second, 'two writes in the same millisecond must not share a revision');
+  assert.ok(Date.parse(second) > Date.parse(first));
+
+  nowMs = frozen - 60_000;
+  const third = await updateRevisionDate(f.env.DB, owner);
+  assert.ok(Date.parse(third) > Date.parse(second), 'a rewinding clock cannot roll the revision back');
+  assert.equal(await getRevisionMs(f.env.DB, owner), Date.parse(third));
+  assert.equal(
+    Date.parse(f.sqlite.prepare('SELECT revision_date FROM user_revisions WHERE user_id = ?').get<any>(owner).revision_date),
+    Date.parse(third),
+    'the ISO mirror stays in lockstep with revision_ms'
+  );
+});
+
+test('the revision-date endpoint hands out strictly increasing millisecond stamps', async (ctx) => {
+  const f = await fixture(ctx);
+  const readStamp = async () => Number(await (await f.route('/api/accounts/revision-date', 'GET')).json());
+
+  const first = await readStamp();
+  assert.ok(Number.isFinite(first) && first > 0, 'the endpoint returns a positive millisecond stamp');
+  assert.equal((await f.route(`/api/ciphers/${id}/partial`, 'PUT', { favorite: true })).status, 200);
+  const second = await readStamp();
+  assert.ok(second > first, `revision must advance, got ${second} after ${first}`);
+  assert.equal((await f.route(`/api/ciphers/${id}/partial`, 'PUT', { favorite: false })).status, 200);
+  const third = await readStamp();
+  assert.ok(third > second, `revision must advance again, got ${third} after ${second}`);
+});
+
+test('the frontend only trusts an exact numeric revision match as current', () => {
+  assert.equal(isCurrentRevision(100, 100), true);
+  assert.equal(isCurrentRevision(99, 100), false, 'an older cache is refetched');
+  assert.equal(isCurrentRevision(101, 100), false, 'a fabricated newer stamp is refetched');
+  assert.equal(isCurrentRevision(undefined, 100), false);
+  assert.equal(isCurrentRevision(100, Number.NaN), false);
+  assert.equal(isCurrentRevision(100, 0), false);
+});
+
+test('the revision migration backfills legacy ISO rows and keeps the old column readable', async (ctx) => {
+  const sqlite = new DatabaseSync(':memory:');
+  ctx.after(async () => { await new Promise((resolve) => setImmediate(resolve)); sqlite.close(); });
+  sqlite.exec('CREATE TABLE user_revisions(user_id TEXT PRIMARY KEY, revision_date TEXT NOT NULL)');
+  sqlite.prepare('INSERT INTO user_revisions(user_id, revision_date) VALUES(?, ?)').run(owner, revision);
+  const db = createSchemaD1Mock(sqlite);
+
+  await ensureUserRevisionSchema(db);
+  const backfilled = sqlite.prepare('SELECT revision_date, revision_ms FROM user_revisions WHERE user_id = ?').get(owner) as any;
+  assert.equal(backfilled.revision_ms, Date.parse(revision), 'legacy ISO rows are backfilled to integer milliseconds');
+  assert.equal(backfilled.revision_date, revision, 'the legacy column is untouched so old builds can still read it');
+
+  await ensureUserRevisionSchema(db);
+  assert.equal(
+    sqlite.prepare('SELECT revision_ms FROM user_revisions WHERE user_id = ?').get<any>(owner).revision_ms,
+    Date.parse(revision),
+    're-running the migration must not move an already-versioned row'
+  );
 });

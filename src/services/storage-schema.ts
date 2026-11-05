@@ -9,6 +9,23 @@
 // - If the new table stores persistent data, update the backup export/import
 //   contract in src/services/backup-archive.ts and backup-import.ts.
 // - Keep statements idempotent; D1 may execute them again on later requests.
+
+// D1-303: `revision_ms` is the authoritative monotonic revision stamp.
+// The backfill only touches rows that still carry the legacy ISO-only value
+// and is guarded against unparseable dates so it can never write NULL into a
+// NOT NULL column.
+const USER_REVISION_SCHEMA_STATEMENTS: readonly string[] = [
+  'CREATE TABLE IF NOT EXISTS user_revisions (' +
+    'user_id TEXT PRIMARY KEY, revision_date TEXT NOT NULL, revision_ms INTEGER NOT NULL DEFAULT 0, ' +
+    'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)',
+  'ALTER TABLE user_revisions ADD COLUMN revision_ms INTEGER NOT NULL DEFAULT 0',
+  'UPDATE user_revisions ' +
+    'SET revision_ms = CAST(strftime(\'%s\', revision_date) AS INTEGER) * 1000 ' +
+    'WHERE revision_ms = 0 ' +
+    "AND revision_date IS NOT NULL AND revision_date <> '' " +
+    "AND strftime('%s', revision_date) IS NOT NULL",
+];
+
 const SCHEMA_STATEMENTS: readonly string[] = [
   'CREATE TABLE IF NOT EXISTS users (' +
   'id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT, master_password_hint TEXT, master_password_hash TEXT NOT NULL, ' +
@@ -34,9 +51,7 @@ const SCHEMA_STATEMENTS: readonly string[] = [
   'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)',
   'ALTER TABLE domain_settings ADD COLUMN custom_equivalent_domains TEXT NOT NULL DEFAULT \'[]\'',
 
-  'CREATE TABLE IF NOT EXISTS user_revisions (' +
-  'user_id TEXT PRIMARY KEY, revision_date TEXT NOT NULL, ' +
-  'FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)',
+  ...USER_REVISION_SCHEMA_STATEMENTS,
 
   'CREATE TABLE IF NOT EXISTS ciphers (' +
   'id TEXT PRIMARY KEY, user_id TEXT NOT NULL, type INTEGER NOT NULL, folder_id TEXT, name TEXT, notes TEXT, ' +
@@ -206,4 +221,13 @@ export async function ensureStorageSchema(db: D1Database): Promise<void> {
     await executeSchemaStatement(db, stmt);
   }
   await ensureAdminUserExists(db);
+}
+
+// Applies only the user_revisions migration (column + legacy backfill).
+// Exposed so migration tests can run it against a legacy-shaped table without
+// bootstrapping the whole schema.
+export async function ensureUserRevisionSchema(db: D1Database): Promise<void> {
+  for (const stmt of USER_REVISION_SCHEMA_STATEMENTS) {
+    await executeSchemaStatement(db, stmt);
+  }
 }

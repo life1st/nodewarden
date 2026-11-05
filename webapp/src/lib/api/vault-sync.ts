@@ -12,6 +12,16 @@ interface VaultSyncResponse {
 const pendingVaultCoreRequests = new Map<string, Promise<VaultCoreSnapshot>>();
 const memoryVaultCoreCache = new Map<string, { revisionStamp: number; snapshot: VaultCoreSnapshot }>();
 
+// D1-303: the server revision stamp is a strictly increasing integer number of
+// milliseconds, so an exact numeric match is the only safe "unchanged" signal.
+// Older, newer, legacy ISO-derived or non-finite stamps all represent some
+// other state and must trigger a refetch instead of being trusted as current.
+export function isCurrentRevision(cachedStamp: number | undefined, serverStamp: number): boolean {
+  if (!Number.isFinite(serverStamp) || serverStamp <= 0) return false;
+  if (typeof cachedStamp !== 'number' || !Number.isFinite(cachedStamp)) return false;
+  return cachedStamp === serverStamp;
+}
+
 function normalizeSnapshot(body: VaultSyncResponse | null | undefined): VaultCoreSnapshot {
   return {
     ciphers: Array.isArray(body?.ciphers) ? body!.ciphers! : [],
@@ -95,14 +105,14 @@ export async function loadVaultCoreSyncSnapshot(authedFetch: AuthedFetch, cacheK
     try {
       const revisionStamp = await getVaultRevisionDate(authedFetch);
       const currentMemory = memoryVaultCoreCache.get(normalizedKey);
-      if (currentMemory?.revisionStamp === revisionStamp) {
+      if (currentMemory && isCurrentRevision(currentMemory.revisionStamp, revisionStamp)) {
         return currentMemory.snapshot;
       }
 
       if (!cached) {
         cached = await loadCachedVaultCoreSnapshot(normalizedKey);
       }
-      if (cached?.revisionStamp === revisionStamp && cached.snapshot) {
+      if (cached?.snapshot && isCurrentRevision(cached.revisionStamp, revisionStamp)) {
         const snapshot = normalizeCachedSnapshot(cached.snapshot);
         memoryVaultCoreCache.set(normalizedKey, {
           revisionStamp,

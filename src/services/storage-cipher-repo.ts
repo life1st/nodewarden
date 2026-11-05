@@ -205,6 +205,20 @@ export async function deleteCipher(db: D1Database, id: string, userId: string): 
   await db.prepare('DELETE FROM ciphers WHERE id = ? AND user_id = ?').bind(id, userId).run();
 }
 
+// D1-301: a permanent delete only removes the exact row the handler read, so a
+// concurrent save or restore is reported as a conflict instead of being
+// silently discarded.
+export function buildCipherDeleteStatement(
+  db: D1Database,
+  id: string,
+  userId: string,
+  expectedUpdatedAt: string
+): D1PreparedStatement {
+  return db
+    .prepare('DELETE FROM ciphers WHERE id = ? AND user_id = ? AND updated_at = ?')
+    .bind(id, userId, expectedUpdatedAt);
+}
+
 export async function bulkSoftDeleteCiphers(
   db: D1Database,
   sqlChunkSize: SqlChunkSize,

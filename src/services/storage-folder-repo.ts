@@ -38,30 +38,69 @@ export async function saveFolder(db: D1Database, folder: Folder): Promise<void> 
     .run();
 }
 
-export async function deleteFolder(db: D1Database, id: string, userId: string): Promise<void> {
-  await db.prepare('DELETE FROM folders WHERE id = ? AND user_id = ?').bind(id, userId).run();
+// D1-302: a rename only lands when the folder still carries the version the
+// handler read, so two concurrent renames cannot silently overwrite each other.
+export async function updateFolderIfUnchanged(
+  db: D1Database,
+  folder: Folder,
+  expectedUpdatedAt: string
+): Promise<boolean> {
+  const result = await db
+    .prepare('UPDATE folders SET name = ?, updated_at = ? WHERE id = ? AND user_id = ? AND updated_at = ?')
+    .bind(folder.name, folder.updatedAt, folder.id, folder.userId, expectedUpdatedAt)
+    .run();
+  return result.meta.changes === 1;
 }
 
-export async function clearFolderFromCiphers(
+export function buildDeleteFolderStatement(
   db: D1Database,
   userId: string,
-  folderId: string
-): Promise<void> {
-  const now = new Date().toISOString();
-  await db
+  folderId: string,
+  expectedUpdatedAt: string
+): D1PreparedStatement {
+  return db
+    .prepare('DELETE FROM folders WHERE id = ? AND user_id = ? AND updated_at = ?')
+    .bind(folderId, userId, expectedUpdatedAt);
+}
+
+// The reference cleanup must move every touched cipher past the version a
+// concurrent writer could already be holding: max(now, current + 1ms). SQLite
+// evaluates the SET clause against the pre-update row, so this reads the stored
+// value; an unparseable timestamp makes the comparison -1 and falls back to
+// `now`. Without the strict bump a write that raced with the folder delete
+// could match the unchanged version and restore a dangling folderId.
+const NEXT_CIPHER_VERSION_SQL =
+  "strftime('%Y-%m-%dT%H:%M:%fZ', (" +
+  'CASE WHEN COALESCE(CAST(strftime(\'%s\', updated_at) AS INTEGER) * 1000 + ' +
+  "CAST(substr(updated_at, 21, 3) AS INTEGER), -1) >= ? " +
+  "THEN CAST(strftime('%s', updated_at) AS INTEGER) * 1000 + " +
+  'CAST(substr(updated_at, 21, 3) AS INTEGER) + 1 ' +
+  'ELSE ? END) / 1000.0, \'unixepoch\')';
+
+export function buildClearFolderFromCiphersStatement(
+  db: D1Database,
+  userId: string,
+  folderId: string,
+  nowMs: number,
+  expectedUpdatedAt: string
+): D1PreparedStatement {
+  return db
     .prepare(
       `UPDATE ciphers
-       SET folder_id = NULL, updated_at = ?,
+       SET folder_id = NULL, updated_at = ${NEXT_CIPHER_VERSION_SQL},
            data = json_remove(data, '$.folderId', '$.folder_id', '$.updatedAt', '$.revisionDate')
        WHERE user_id = ?
          AND (
            folder_id = ?
            OR json_extract(data, '$.folderId') = ?
            OR json_extract(data, '$.folder_id') = ?
+         )
+         AND EXISTS (
+           SELECT 1 FROM folders
+           WHERE id = ? AND user_id = ? AND updated_at = ?
          )`
     )
-    .bind(now, userId, folderId, folderId, folderId)
-    .run();
+    .bind(nowMs, nowMs, userId, folderId, folderId, folderId, folderId, userId, expectedUpdatedAt);
 }
 
 export async function bulkDeleteFolders(

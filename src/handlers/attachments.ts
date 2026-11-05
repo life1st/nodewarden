@@ -515,11 +515,21 @@ export async function handleDeleteAttachment(
 }
 
 // Delete all attachments for a cipher (used when deleting cipher)
-export async function deleteAllAttachmentsForCipher(
+/**
+ * Removes only the R2 blobs of one cipher's attachments. D1-301 deletes the
+ * attachment rows inside its own transaction, so blob cleanup runs afterwards:
+ * a failure here can leave unreferenced blobs, never a cipher whose
+ * attachments were already destroyed.
+ */
+export async function deleteAttachmentBlobs(
   env: Env,
-  cipherId: string
+  cipherId: string,
+  attachments: Attachment[]
 ): Promise<void> {
-  await deleteAllAttachmentsForCiphers(env, [cipherId]);
+  if (!attachments.length) return;
+  await runWithConcurrency(attachments, LIMITS.performance.attachmentDeleteConcurrency, async (attachment) => {
+    await deleteBlobObject(env, getAttachmentObjectKey(cipherId, attachment.id));
+  });
 }
 
 export async function deleteAllAttachmentsForCiphers(
@@ -533,10 +543,15 @@ export async function deleteAllAttachmentsForCiphers(
   );
   if (!attachments.length) return;
 
-  await runWithConcurrency(attachments, LIMITS.performance.attachmentDeleteConcurrency, async ({ attachment, cipherId }) => {
-    const path = getAttachmentObjectKey(cipherId, attachment.id);
-    await deleteBlobObject(env, path);
-  });
+  const attachmentsByOwnedCipher = new Map<string, Attachment[]>();
+  for (const { attachment, cipherId } of attachments) {
+    const list = attachmentsByOwnedCipher.get(cipherId) ?? [];
+    list.push(attachment);
+    attachmentsByOwnedCipher.set(cipherId, list);
+  }
+  for (const [ownedCipherId, ownedAttachments] of attachmentsByOwnedCipher) {
+    await deleteAttachmentBlobs(env, ownedCipherId, ownedAttachments);
+  }
 
   await storage.bulkDeleteAttachmentsByIds(attachments.map(({ attachment }) => attachment.id));
 }

@@ -49,9 +49,13 @@ CREATE TABLE IF NOT EXISTS domain_settings (
 );
 
 -- Per-user sync revision date
+-- revision_ms is the authoritative monotonic stamp (D1-303); revision_date is
+-- the ISO-8601 mirror kept for older clients and rollback. Existing installs
+-- get the column and the legacy backfill from src/services/storage-schema.ts.
 CREATE TABLE IF NOT EXISTS user_revisions (
   user_id TEXT PRIMARY KEY,
   revision_date TEXT NOT NULL,
+  revision_ms INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 

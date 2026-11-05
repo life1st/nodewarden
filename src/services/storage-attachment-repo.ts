@@ -106,6 +106,26 @@ export function buildAttachmentsByCipherStatement(db: D1Database, cipherId: stri
     .bind(cipherId);
 }
 
+/**
+ * D1-301: removes the attachment rows of a cipher the caller is about to
+ * delete, but only while that cipher still carries `expectedUpdatedAt`. Runs
+ * inside the same batch as the guarded cipher DELETE so a lost race deletes
+ * neither the rows nor the cipher.
+ */
+export function buildAttachmentsDeleteForCipherStatement(
+  db: D1Database,
+  cipherId: string,
+  userId: string,
+  expectedCipherUpdatedAt: string
+): D1PreparedStatement {
+  return db
+    .prepare(
+      'DELETE FROM attachments WHERE cipher_id = ? AND EXISTS (' +
+        'SELECT 1 FROM ciphers WHERE id = ? AND user_id = ? AND updated_at = ?)'
+    )
+    .bind(cipherId, cipherId, userId, expectedCipherUpdatedAt);
+}
+
 export async function getAttachmentsByCipher(db: D1Database, cipherId: string): Promise<Attachment[]> {
   const res = await buildAttachmentsByCipherStatement(db, cipherId).all<any>();
   return parseAttachmentRows(res.results);

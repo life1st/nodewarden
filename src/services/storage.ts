@@ -38,13 +38,14 @@ import {
 } from './storage-admin-repo';
 import {
   bulkDeleteFolders as deleteStoredFolders,
-  clearFolderFromCiphers as clearStoredFolderFromCiphers,
-  deleteFolder as deleteStoredFolder,
+  buildClearFolderFromCiphersStatement as buildStoredClearFolderFromCiphersStatement,
+  buildDeleteFolderStatement as buildStoredDeleteFolderStatement,
   getAllFolders as listStoredFolders,
   getFolder as findStoredFolder,
   getFolderForUser as findStoredFolderForUser,
   getFoldersPage as listStoredFoldersPage,
   saveFolder as saveStoredFolder,
+  updateFolderIfUnchanged as updateStoredFolderIfUnchanged,
 } from './storage-folder-repo';
 import {
   bulkArchiveCiphers as archiveStoredCiphers,
@@ -61,6 +62,7 @@ import {
   saveCipher as saveStoredCipher,
   updateCipherIfUnchanged as updateStoredCipherIfUnchanged,
   buildCipherUpdateStatement as buildStoredCipherUpdateStatement,
+  buildCipherDeleteStatement as buildStoredCipherDeleteStatement,
   deleteCipher as deleteStoredCipher,
 } from './storage-cipher-repo';
 import {
@@ -76,6 +78,7 @@ import {
   getAttachmentsByCipherIds as listStoredAttachmentsByCipherIds,
   getAttachmentsByUserId as listStoredAttachmentsByUserId,
   buildAttachmentsByCipherStatement as buildStoredAttachmentsByCipherStatement,
+  buildAttachmentsDeleteForCipherStatement as buildStoredAttachmentsDeleteForCipherStatement,
   parseAttachmentRows as parseStoredAttachmentRows,
   saveAttachment as saveStoredAttachment,
   updateCipherRevisionDate as updateStoredCipherRevisionDate,
@@ -144,8 +147,10 @@ import {
 } from './storage-totp-replay-repo';
 import {
   getRevisionDate as getStoredRevisionDate,
+  getRevisionMs as getStoredRevisionMs,
   updateRevisionDate as updateStoredRevisionDate,
-  buildConditionalRevisionUpsertStatement as buildStoredConditionalRevisionUpsertStatement,
+  buildRevisionUpsertIfStatement as buildStoredRevisionUpsertIfStatement,
+  buildRevisionSelectStatement as buildStoredRevisionSelectStatement,
 } from './storage-revision-repo';
 import {
   getUserDomainSettings as getStoredUserDomainSettings,
@@ -170,7 +175,7 @@ const STORAGE_SCHEMA_VERSION_KEY = 'schema.version';
 // Bump this whenever src/services/storage-schema.ts or migrations/0001_init.sql
 // changes. Existing D1 installs only rerun ensureStorageSchema() when this value
 // differs from config.schema.version.
-const STORAGE_SCHEMA_VERSION = '2026-07-13-refresh-session-reuse';
+const STORAGE_SCHEMA_VERSION = '2026-11-05-user-revision-ms';
 const REQUIRED_SCHEMA_TABLES = ['webauthn_credentials', 'webauthn_challenges', 'auth_requests', 'totp_login_replays'] as const;
 
 // D1-backed storage.
@@ -506,33 +511,87 @@ export class StorageService {
   }
 
   /**
-   * D1-201 / D1-203: runs the conditional cipher UPDATE, the conditional user
-   * revision upsert and the attachment snapshot read in a single `db.batch()`,
-   * so one save costs one D1 round trip on the write side. The revision
-   * statement only takes effect when the UPDATE matched (its EXISTS clause
-   * checks the updated-at the UPDATE just wrote), and the returned attachment
-   * rows replace the old post-update attachment read.
+   * D1-201 / D1-203 / D1-301: runs the conditional cipher UPDATE, the
+   * conditional user revision upsert and (optionally) the attachment snapshot
+   * read in a single `db.batch()`, so one save costs one D1 round trip on the
+   * write side. The revision statement only takes effect when the UPDATE
+   * matched (its EXISTS clause checks the updated-at the UPDATE just wrote),
+   * and the read-back returns the revision value SQL actually stored so
+   * notifications never announce a stamp older than the stored one.
+   * When `updated` is false the revision is the untouched previous value.
    */
   async updateCipherAndRevisionIfUnchanged(
     cipher: Cipher,
     expectedUpdatedAt: string,
-    revisionDate: string
-  ): Promise<{ updated: boolean; attachments: Attachment[] }> {
-    const statements = [
+    revisionDate: string,
+    options: { includeAttachments?: boolean } = {}
+  ): Promise<{ updated: boolean; attachments: Attachment[]; revisionDate: string }> {
+    const includeAttachments = options.includeAttachments !== false;
+    const revisionMs = Date.parse(revisionDate);
+    const cipherGuard = 'SELECT 1 FROM ciphers WHERE id = ? AND user_id = ? AND updated_at = ?';
+    const statements: D1PreparedStatement[] = [
       buildStoredCipherUpdateStatement(this.db, this.safeBind.bind(this), cipher, expectedUpdatedAt),
-      buildStoredConditionalRevisionUpsertStatement(
+      buildStoredRevisionUpsertIfStatement(
         this.db,
         cipher.userId,
-        revisionDate,
+        revisionMs,
+        cipherGuard,
         cipher.id,
+        cipher.userId,
         cipher.updatedAt
       ),
-      buildStoredAttachmentsByCipherStatement(this.db, cipher.id),
     ];
+    let attachmentsResultIndex = -1;
+    if (includeAttachments) {
+      statements.push(buildStoredAttachmentsByCipherStatement(this.db, cipher.id));
+      attachmentsResultIndex = statements.length - 1;
+    }
+    statements.push(buildStoredRevisionSelectStatement(this.db, cipher.userId));
+    const revisionResultIndex = statements.length - 1;
+
     const results = await this.db.batch(statements);
     const updated = (results[0]?.meta?.changes ?? 0) === 1;
-    const attachments = parseStoredAttachmentRows(results[2]?.results as any[] | undefined);
-    return { updated, attachments };
+    const attachments = includeAttachments
+      ? parseStoredAttachmentRows(results[attachmentsResultIndex]?.results as any[] | undefined)
+      : [];
+    const revisionRow = results[revisionResultIndex]?.results?.[0] as { revision_date?: string } | undefined;
+    return { updated, attachments, revisionDate: revisionRow?.revision_date ?? revisionDate };
+  }
+
+  /**
+   * D1-301: permanent delete guarded by the version the handler read. The
+   * revision bump, the attachment row removal and the cipher delete share one
+   * transaction and the same version guard, so a losing race changes nothing
+   * and the caller reports a conflict instead of destroying a row another
+   * request just modified. Attachment blobs live in R2 and are removed by the
+   * caller only after this batch succeeds.
+   */
+  async deleteCipherWithRevisionIfUnchanged(
+    id: string,
+    userId: string,
+    expectedUpdatedAt: string,
+    revisionDate: string
+  ): Promise<{ deleted: boolean; revisionDate: string }> {
+    const revisionMs = Date.parse(revisionDate);
+    const statements: D1PreparedStatement[] = [
+      buildStoredRevisionUpsertIfStatement(
+        this.db,
+        userId,
+        revisionMs,
+        'SELECT 1 FROM ciphers WHERE id = ? AND user_id = ? AND updated_at = ?',
+        id,
+        userId,
+        expectedUpdatedAt
+      ),
+      buildStoredAttachmentsDeleteForCipherStatement(this.db, id, userId, expectedUpdatedAt),
+      buildStoredCipherDeleteStatement(this.db, id, userId, expectedUpdatedAt),
+      buildStoredRevisionSelectStatement(this.db, userId),
+    ];
+
+    const results = await this.db.batch(statements);
+    const deleted = (results[2]?.meta?.changes ?? 0) === 1;
+    const revisionRow = results[3]?.results?.[0] as { revision_date?: string } | undefined;
+    return { deleted, revisionDate: revisionRow?.revision_date ?? revisionDate };
   }
 
   async deleteCipher(id: string, userId: string): Promise<void> {
@@ -589,8 +648,44 @@ export class StorageService {
     await saveStoredFolder(this.db, folder);
   }
 
-  async deleteFolder(id: string, userId: string): Promise<void> {
-    await deleteStoredFolder(this.db, id, userId);
+  /** D1-302: folder rename only lands when the version the handler read is current. */
+  async updateFolderIfUnchanged(folder: Folder, expectedUpdatedAt: string): Promise<boolean> {
+    return updateStoredFolderIfUnchanged(this.db, folder, expectedUpdatedAt);
+  }
+
+  /**
+   * D1-302: clears the cipher references and deletes the folder in one batch,
+   * all guarded by the folder version the handler read. A folder that another
+   * request renamed or deleted first makes every statement no-op, so no
+   * references are cleared and no revision is bumped; the caller then reports
+   * the conflict.
+   */
+  async deleteFolderWithCiphersIfUnchanged(
+    userId: string,
+    folderId: string,
+    expectedUpdatedAt: string
+  ): Promise<{ deleted: boolean; revisionDate: string | null }> {
+    const revisionMs = Date.now();
+    const folderGuard = 'SELECT 1 FROM folders WHERE id = ? AND user_id = ? AND updated_at = ?';
+    const statements: D1PreparedStatement[] = [
+      buildStoredRevisionUpsertIfStatement(
+        this.db,
+        userId,
+        revisionMs,
+        folderGuard,
+        folderId,
+        userId,
+        expectedUpdatedAt
+      ),
+      buildStoredClearFolderFromCiphersStatement(this.db, userId, folderId, revisionMs, expectedUpdatedAt),
+      buildStoredDeleteFolderStatement(this.db, userId, folderId, expectedUpdatedAt),
+      buildStoredRevisionSelectStatement(this.db, userId),
+    ];
+
+    const results = await this.db.batch(statements);
+    const deleted = (results[2]?.meta?.changes ?? 0) === 1;
+    const revisionRow = results[3]?.results?.[0] as { revision_date?: string } | undefined;
+    return { deleted, revisionDate: deleted ? revisionRow?.revision_date ?? null : null };
   }
 
   async bulkDeleteFolders(ids: string[], userId: string): Promise<string | null> {
@@ -601,12 +696,6 @@ export class StorageService {
       this.sqlChunkSize.bind(this),
       this.updateRevisionDate.bind(this)
     );
-  }
-
-  // Clear folder references from all ciphers owned by the user.
-  // Without this, deleting a folder leaves stale folderId values in cipher JSON.
-  async clearFolderFromCiphers(userId: string, folderId: string): Promise<void> {
-    await clearStoredFolderFromCiphers(this.db, userId, folderId);
   }
 
   async getAllFolders(userId: string): Promise<Folder[]> {
@@ -979,6 +1068,11 @@ export class StorageService {
 
   async getRevisionDate(userId: string): Promise<string> {
     return getStoredRevisionDate(this.db, userId);
+  }
+
+  /** D1-303: strictly increasing integer millisecond revision stamp. */
+  async getRevisionMs(userId: string): Promise<number> {
+    return getStoredRevisionMs(this.db, userId);
   }
 
   async updateRevisionDate(userId: string): Promise<string> {

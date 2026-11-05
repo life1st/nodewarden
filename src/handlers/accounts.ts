@@ -1497,11 +1497,10 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
 export async function handleGetRevisionDate(request: Request, env: Env, userId: string): Promise<Response> {
   void request;
   const storage = new StorageService(env.DB);
-  const revisionDate = await storage.getRevisionDate(userId);
-
-  // Return as milliseconds timestamp (Bitwarden format)
-  const timestamp = new Date(revisionDate).getTime();
-  return jsonResponse(timestamp);
+  // D1-303: strictly increasing integer milliseconds, so clients can compare
+  // stamps numerically and never treat two different states as "unchanged".
+  const revisionMs = await storage.getRevisionMs(userId);
+  return jsonResponse(revisionMs);
 }
 
 // POST /api/accounts/verify-password

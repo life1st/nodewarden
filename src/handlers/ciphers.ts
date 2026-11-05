@@ -24,7 +24,7 @@ import {
 } from '../durable/notifications-hub';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
-import { deleteAllAttachmentsForCipher, deleteAllAttachmentsForCiphers } from './attachments';
+import { deleteAllAttachmentsForCiphers, deleteAttachmentBlobs } from './attachments';
 import { parsePagination, encodeContinuationToken } from '../utils/pagination';
 import { readActingDeviceIdentifier } from '../utils/device';
 import { auditRequestMetadata, writeAuditEvent } from '../services/audit-events';
@@ -52,6 +52,25 @@ function normalizeOptionalId(value: unknown): string | null {
   if (value == null) return null;
   const normalized = String(value).trim();
   return normalized ? normalized : null;
+}
+
+// D1-301: every conditional write reports the same conflict so clients resync
+// instead of overwriting a row another request already changed. The message is
+// localized by the web client; 409 marks it as a version conflict (the stale
+// `lastKnownRevisionDate` input error below stays 400).
+const CIPHER_CONFLICT_MESSAGE = 'The client copy of this cipher is out of date. Resync the client and try again.';
+
+function cipherConflictResponse(): Response {
+  return errorResponse(CIPHER_CONFLICT_MESSAGE, 409);
+}
+
+// Per-cipher monotonic stamp: a write that lands in the same millisecond as
+// the version it read still advances updated_at, so the next conditional write
+// can never match a row that has already been modified.
+function nextCipherUpdatedAt(currentUpdatedAt: string): string {
+  const currentMs = Date.parse(currentUpdatedAt);
+  const base = Number.isFinite(currentMs) ? currentMs : 0;
+  return new Date(Math.max(Date.now(), base + 1)).toISOString();
 }
 
 function normalizeResponseFolderId(folderId: unknown, validFolderIds?: ReadonlySet<string>): string | null {
@@ -1057,7 +1076,7 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
   }
 
   if (isStaleCipherUpdate(existingCipher.updatedAt, incomingRevisionDate)) {
-    return errorResponse('The client copy of this cipher is out of date. Resync the client and try again.', 400);
+    return errorResponse(CIPHER_CONFLICT_MESSAGE, 400);
   }
 
   const nextType = Number(cipherData.type) || existingCipher.type;
@@ -1135,16 +1154,16 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     return jsonResponse(cipherToResponse(existingCipher, attachments, responseOptions));
   }
 
-  // D1-201: cipher update, conditional revision bump and the attachment
-  // snapshot for the response travel in one batch (one D1 round trip).
-  const revisionDate = new Date().toISOString();
-  const { updated, attachments } = await storage.updateCipherAndRevisionIfUnchanged(
+  // D1-201 / D1-301: cipher update, conditional revision bump and the
+  // attachment snapshot for the response travel in one batch (one D1 round
+  // trip); the returned revisionDate is the value SQL actually stored.
+  const { updated, attachments, revisionDate } = await storage.updateCipherAndRevisionIfUnchanged(
     cipher,
     existingCipher.updatedAt,
-    revisionDate
+    new Date().toISOString()
   );
   if (!updated) {
-    return errorResponse('The client copy of this cipher is out of date. Resync the client and try again.', 400);
+    return cipherConflictResponse();
   }
   // Rejected updates must not modify attachment metadata either.
   await syncIncomingAttachmentMetadata(storage, cipherData, attachments);
@@ -1165,12 +1184,22 @@ export async function handleDeleteCipher(request: Request, env: Env, userId: str
     return errorResponse('Cipher not found', 404);
   }
 
-  // Soft delete
-  cipher.deletedAt = new Date().toISOString();
-  cipher.updatedAt = cipher.deletedAt;
+  // Soft delete (D1-301): only the version this handler read may be deleted,
+  // so a concurrent save cannot be silently discarded or resurrected.
+  const expectedUpdatedAt = cipher.updatedAt;
+  const stamp = nextCipherUpdatedAt(expectedUpdatedAt);
+  cipher.deletedAt = stamp;
+  cipher.updatedAt = stamp;
   syncCipherComputedAliases(cipher);
-  await storage.saveCipher(cipher);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  const { updated, revisionDate } = await storage.updateCipherAndRevisionIfUnchanged(
+    cipher,
+    expectedUpdatedAt,
+    new Date().toISOString(),
+    { includeAttachments: false }
+  );
+  if (!updated) {
+    return cipherConflictResponse();
+  }
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyCipherDeleteForRequest(request, env, cipher, revisionDate);
   await writeCipherAudit(storage, request, userId, 'cipher.delete.soft', {
@@ -1182,6 +1211,29 @@ export async function handleDeleteCipher(request: Request, env: Env, userId: str
   return jsonResponse(
     cipherToResponse(cipher, [], cipherResponseOptionsForRequest(request))
   );
+}
+
+// D1-301: permanent delete commits the guarded D1 writes (revision, attachment
+// rows, cipher) in one batch first and only then removes the R2 blobs. A lost
+// version race therefore touches nothing, while a blob cleanup failure can only
+// leave unreferenced blobs behind - never a live cipher whose attachments are
+// already gone.
+async function permanentlyDeleteCipher(
+  env: Env,
+  storage: StorageService,
+  cipher: Cipher
+): Promise<{ deleted: boolean; revisionDate: string }> {
+  const attachments = await storage.getAttachmentsByCipher(cipher.id);
+  const result = await storage.deleteCipherWithRevisionIfUnchanged(
+    cipher.id,
+    cipher.userId,
+    cipher.updatedAt,
+    new Date().toISOString()
+  );
+  if (result.deleted) {
+    await deleteAttachmentBlobs(env, cipher.id, attachments);
+  }
+  return result;
 }
 
 // DELETE /api/ciphers/:id (compat mode)
@@ -1198,9 +1250,10 @@ export async function handleDeleteCipherCompat(request: Request, env: Env, userI
   }
 
   if (cipher.deletedAt) {
-    await deleteAllAttachmentsForCipher(env, id);
-    await storage.deleteCipher(id, userId);
-    const revisionDate = await storage.updateRevisionDate(userId);
+    const { deleted, revisionDate } = await permanentlyDeleteCipher(env, storage, cipher);
+    if (!deleted) {
+      return cipherConflictResponse();
+    }
     notifyVaultSyncForRequest(request, env, userId, revisionDate);
     notifyCipherDeleteForRequest(request, env, cipher, revisionDate);
     await writeCipherAudit(storage, request, userId, 'cipher.delete.permanent', {
@@ -1224,11 +1277,10 @@ export async function handlePermanentDeleteCipher(request: Request, env: Env, us
     return errorResponse('Cipher not found', 404);
   }
 
-  // Delete all attachments first
-  await deleteAllAttachmentsForCipher(env, id);
-
-  await storage.deleteCipher(id, userId);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  const { deleted, revisionDate } = await permanentlyDeleteCipher(env, storage, cipher);
+  if (!deleted) {
+    return cipherConflictResponse();
+  }
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyCipherDeleteForRequest(request, env, cipher, revisionDate);
   await writeCipherAudit(storage, request, userId, 'cipher.delete.permanent', {
@@ -1249,11 +1301,19 @@ export async function handleRestoreCipher(request: Request, env: Env, userId: st
     return errorResponse('Cipher not found', 404);
   }
 
+  const expectedUpdatedAt = cipher.updatedAt;
   cipher.deletedAt = null;
-  cipher.updatedAt = new Date().toISOString();
+  cipher.updatedAt = nextCipherUpdatedAt(expectedUpdatedAt);
   syncCipherComputedAliases(cipher);
-  await storage.saveCipher(cipher);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  const { updated, revisionDate } = await storage.updateCipherAndRevisionIfUnchanged(
+    cipher,
+    expectedUpdatedAt,
+    new Date().toISOString(),
+    { includeAttachments: false }
+  );
+  if (!updated) {
+    return cipherConflictResponse();
+  }
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyCipherUpdateForRequest(request, env, cipher, revisionDate);
 
@@ -1289,11 +1349,19 @@ export async function handlePartialUpdateCipher(request: Request, env: Env, user
   if (body.favorite !== undefined) {
     cipher.favorite = body.favorite;
   }
-  cipher.updatedAt = new Date().toISOString();
+  const expectedUpdatedAt = cipher.updatedAt;
+  cipher.updatedAt = nextCipherUpdatedAt(expectedUpdatedAt);
   syncCipherComputedAliases(cipher);
 
-  await storage.saveCipher(cipher);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  const { updated, revisionDate } = await storage.updateCipherAndRevisionIfUnchanged(
+    cipher,
+    expectedUpdatedAt,
+    new Date().toISOString(),
+    { includeAttachments: false }
+  );
+  if (!updated) {
+    return cipherConflictResponse();
+  }
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyCipherUpdateForRequest(request, env, cipher, revisionDate);
 
@@ -1366,15 +1434,22 @@ export async function handleArchiveCipher(request: Request, env: Env, userId: st
     return errorResponse('Cannot archive a deleted cipher', 400);
   }
 
-  cipher.archivedAt = new Date().toISOString();
-  cipher.updatedAt = cipher.archivedAt;
+  const expectedUpdatedAt = cipher.updatedAt;
+  const stamp = nextCipherUpdatedAt(expectedUpdatedAt);
+  cipher.archivedAt = stamp;
+  cipher.updatedAt = stamp;
   normalizeCipherForStorage(cipher);
-  await storage.saveCipher(cipher);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  const { updated, attachments, revisionDate } = await storage.updateCipherAndRevisionIfUnchanged(
+    cipher,
+    expectedUpdatedAt,
+    new Date().toISOString()
+  );
+  if (!updated) {
+    return cipherConflictResponse();
+  }
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyCipherUpdateForRequest(request, env, cipher, revisionDate);
 
-  const attachments = await storage.getAttachmentsByCipher(cipher.id);
   return jsonResponse(
     cipherToResponse(cipher, attachments, cipherResponseOptionsForRequest(request))
   );
@@ -1389,14 +1464,20 @@ export async function handleUnarchiveCipher(request: Request, env: Env, userId: 
     return errorResponse('Cipher not found', 404);
   }
 
+  const expectedUpdatedAt = cipher.updatedAt;
   cipher.archivedAt = null;
-  cipher.updatedAt = new Date().toISOString();
+  cipher.updatedAt = nextCipherUpdatedAt(expectedUpdatedAt);
   normalizeCipherForStorage(cipher);
-  await storage.saveCipher(cipher);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  const { updated, attachments, revisionDate } = await storage.updateCipherAndRevisionIfUnchanged(
+    cipher,
+    expectedUpdatedAt,
+    new Date().toISOString()
+  );
+  if (!updated) {
+    return cipherConflictResponse();
+  }
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
 
-  const attachments = await storage.getAttachmentsByCipher(cipher.id);
   return jsonResponse(
     cipherToResponse(cipher, attachments, cipherResponseOptionsForRequest(request))
   );

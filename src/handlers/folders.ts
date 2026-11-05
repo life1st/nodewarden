@@ -53,6 +53,18 @@ function folderToResponse(folder: Folder): FolderResponse {
   };
 }
 
+// D1-302: a folder write that lost its version race reports a conflict so the
+// client resyncs instead of overwriting the winner.
+const FOLDER_CONFLICT_MESSAGE = 'The client copy of this folder is out of date. Resync the client and try again.';
+
+// Folder versions advance like cipher versions: a rename that lands in the same
+// millisecond as the version it read still moves updated_at forward.
+function nextFolderUpdatedAt(currentUpdatedAt: string): string {
+  const currentMs = Date.parse(currentUpdatedAt);
+  const base = Number.isFinite(currentMs) ? currentMs : 0;
+  return new Date(Math.max(Date.now(), base + 1)).toISOString();
+}
+
 // GET /api/folders
 export async function handleGetFolders(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
@@ -142,12 +154,16 @@ export async function handleUpdateFolder(request: Request, env: Env, userId: str
     return errorResponse('Invalid JSON', 400);
   }
 
+  const expectedUpdatedAt = folder.updatedAt;
   if (body.name) {
     folder.name = body.name;
   }
-  folder.updatedAt = new Date().toISOString();
+  folder.updatedAt = nextFolderUpdatedAt(expectedUpdatedAt);
 
-  await storage.saveFolder(folder);
+  const updated = await storage.updateFolderIfUnchanged(folder, expectedUpdatedAt);
+  if (!updated) {
+    return errorResponse(FOLDER_CONFLICT_MESSAGE, 409);
+  }
   const revisionDate = await storage.updateRevisionDate(userId);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyUserFolderUpdate(env, {
@@ -169,9 +185,17 @@ export async function handleDeleteFolder(request: Request, env: Env, userId: str
     return errorResponse('Folder not found', 404);
   }
 
-  await storage.clearFolderFromCiphers(userId, id);
-  await storage.deleteFolder(id, userId);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  // D1-302: reference cleanup, folder delete and the revision bump share one
+  // batch guarded by the version read above, so a concurrent rename/delete
+  // leaves both the folder and its references untouched.
+  const { deleted, revisionDate } = await storage.deleteFolderWithCiphersIfUnchanged(
+    userId,
+    id,
+    folder.updatedAt
+  );
+  if (!deleted || !revisionDate) {
+    return errorResponse(FOLDER_CONFLICT_MESSAGE, 409);
+  }
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyUserFolderDelete(env, {
     userId,
