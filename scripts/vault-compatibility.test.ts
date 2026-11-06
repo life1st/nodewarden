@@ -292,6 +292,162 @@ test('attachment metadata changes still take the write path for an otherwise ide
   assert.equal(f.sqlite.prepare('SELECT COUNT(*) AS n FROM user_revisions').get<any>().n, 1);
 });
 
+test('attachment metadata updates share the cipher batch and span shards safely', async (ctx) => {
+  const f = await fixture(ctx);
+  const attachments = Array.from({ length: 51 }, (_, index) => ({
+    id: `00000000-0000-4000-9000-${String(index).padStart(12, '0')}`,
+    cipherId: id,
+    fileName: '',
+    key: null,
+    size: index + 1,
+    sizeName: `${index + 1} B`,
+  }));
+  for (const attachment of attachments) {
+    attachment.fileName = await encrypt(`file-${attachment.id}.txt`);
+    await f.storage.saveAttachment(attachment);
+  }
+
+  const incoming: Record<string, { fileName: string }> = {};
+  const renamed = new Map<string, string>();
+  for (const attachment of attachments) {
+    const fileName = await encrypt(`renamed-${attachment.id}.txt`);
+    incoming[attachment.id] = { fileName };
+    renamed.set(attachment.id, fileName);
+  }
+
+  const batchesBefore = f.stats.batches;
+  const response = await f.route(`/api/ciphers/${id}`, 'PUT', {
+    name: await encrypt('Sharded attachment title'),
+    lastKnownRevisionDate: revision,
+    attachments2: incoming,
+  });
+  assert.equal(response.status, 200);
+  assert.equal(f.stats.batches - batchesBefore, 2, '51 attachment updates run in two batches');
+
+  const body: any = await response.json();
+  assert.equal(body.attachments.length, attachments.length, 'the response renders the pre-batch snapshot');
+  const stored = await f.storage.getAttachmentsByCipher(id);
+  assert.equal(stored.length, attachments.length);
+  for (const attachment of stored) {
+    assert.equal(attachment.fileName, renamed.get(attachment.id) ?? attachment.fileName);
+  }
+});
+
+test('a bulk archive packs many ids into one write batch and bumps the revision once', async (ctx) => {
+  const f = await fixture(ctx);
+  const ids: string[] = [];
+  for (let index = 0; index < 100; index += 1) {
+    const cipherId = `00000000-0000-4000-9100-${String(index).padStart(12, '0')}`;
+    ids.push(cipherId);
+    await f.storage.saveCipher({ ...f.base, id: cipherId });
+  }
+
+  const revisionBefore = await getRevisionMs(f.env.DB, owner);
+  const batchesBefore = f.stats.batches;
+  const result = await f.storage.bulkArchiveCiphers(ids, owner);
+  assert.equal(result.failed, false);
+  assert.equal(result.completedCount, 100);
+  assert.ok(result.revisionDate);
+  assert.equal(f.stats.batches - batchesBefore, 1, '100 ids fit in a single write batch');
+  assert.ok((await getRevisionMs(f.env.DB, owner)) > revisionBefore, 'the successful bulk bumps the revision');
+  assert.equal(
+    f.sqlite.prepare('SELECT COUNT(*) AS n FROM ciphers WHERE archived_at IS NOT NULL').get<any>().n,
+    100
+  );
+});
+
+test('a failed bulk chunk rolls back that chunk and reports the completed count', async (ctx) => {
+  const f = await fixture(ctx);
+  const ids: string[] = [];
+  for (let index = 0; index < 200; index += 1) {
+    const cipherId = `00000000-0000-4000-9200-${String(index).padStart(12, '0')}`;
+    ids.push(cipherId);
+    await f.storage.saveCipher({ ...f.base, id: cipherId });
+  }
+
+  // Force many small id chunks so the second statement group forms a second
+  // batch; the first batch commits, the second is rejected as a whole.
+  ctx.mock.method(StorageService.prototype as any, 'sqlChunkSize', () => 2);
+  const originalBatch = f.env.DB.batch.bind(f.env.DB);
+  let batchCalls = 0;
+  f.env.DB.batch = async (statements: any[]) => {
+    batchCalls += 1;
+    if (batchCalls === 2) throw new Error('simulated bulk failure');
+    return originalBatch(statements);
+  };
+
+  const result = await f.storage.bulkArchiveCiphers(ids, owner);
+  assert.equal(result.failed, true);
+  assert.equal(result.completedCount, 196, 'the first batch completed before the failure');
+  assert.equal(result.totalCount, 200);
+  assert.ok(result.revisionDate, 'the completed chunk bumped the revision');
+  assert.equal(
+    f.sqlite.prepare('SELECT COUNT(*) AS n FROM ciphers WHERE archived_at IS NOT NULL').get<any>().n,
+    196
+  );
+  for (const cipherId of ids.slice(196)) {
+    assert.equal((await f.storage.getCipherForUser(cipherId, owner))?.archivedAt, null, 'the failed chunk is rolled back');
+  }
+});
+
+test('bulk permanent delete keeps attachment rows in the cipher transaction', async (ctx) => {
+  const f = await fixture(ctx);
+  const ids: string[] = [];
+  for (let index = 0; index < 60; index += 1) {
+    const cipherId = `00000000-0000-4000-9300-${String(index).padStart(12, '0')}`;
+    ids.push(cipherId);
+    await f.storage.saveCipher({ ...f.base, id: cipherId });
+    await f.storage.saveAttachment({
+      id: `00000000-0000-4000-9400-${String(index).padStart(12, '0')}`,
+      cipherId,
+      fileName: await encrypt(`attachment-${index}.txt`),
+      key: null,
+      size: 1,
+      sizeName: '1 B',
+    });
+  }
+
+  ctx.mock.method(StorageService.prototype as any, 'sqlChunkSize', () => 1);
+  const originalBatch = f.env.DB.batch.bind(f.env.DB);
+  let batchCalls = 0;
+  f.env.DB.batch = async (statements: any[]) => {
+    batchCalls += 1;
+    if (batchCalls === 2) throw new Error('simulated bulk delete failure');
+    return originalBatch(statements);
+  };
+
+  const result = await f.storage.bulkDeleteCiphers(ids, owner);
+  assert.equal(result.failed, true);
+  assert.equal(result.completedCount, 49);
+  for (const [index, cipherId] of ids.entries()) {
+    const attachmentId = `00000000-0000-4000-9400-${String(index).padStart(12, '0')}`;
+    if (index < 49) {
+      assert.equal(await f.storage.getCipherForUser(cipherId, owner), null);
+      assert.equal(await f.storage.getAttachment(attachmentId), null);
+    } else {
+      assert.ok(await f.storage.getCipherForUser(cipherId, owner), 'the failed chunk keeps its cipher');
+      assert.ok(await f.storage.getAttachment(attachmentId), 'the failed chunk keeps its attachment metadata');
+    }
+  }
+});
+
+test('the bulk handler exposes the completed count when a chunk fails', async (ctx) => {
+  const f = await fixture(ctx);
+  ctx.mock.method(StorageService.prototype, 'bulkArchiveCiphers', async () => ({
+    revisionDate: revision,
+    completedCount: 2,
+    totalCount: 3,
+    failed: true,
+  }));
+
+  const response = await f.route('/api/ciphers/archive', 'PUT', { ids: ['a', 'b', 'c'] });
+  assert.equal(response.status, 500);
+  const body: any = await response.json();
+  assert.equal(body.completedCount, 2);
+  assert.equal(body.totalCount, 3);
+  assert.match(body.error_description, /2 of 3/);
+});
+
 test('a failing statement inside the update batch rolls the cipher write back', async (ctx) => {
   const f = await fixture(ctx);
   const stored = (await f.storage.getCipherForUser(id, owner))!;

@@ -48,6 +48,7 @@ import {
   updateFolderIfUnchanged as updateStoredFolderIfUnchanged,
 } from './storage-folder-repo';
 import {
+  type BulkCipherMutationResult,
   bulkArchiveCiphers as archiveStoredCiphers,
   bulkDeleteCiphers as deleteStoredCiphers,
   bulkMoveCiphers as moveStoredCiphers,
@@ -79,6 +80,7 @@ import {
   getAttachmentsByUserId as listStoredAttachmentsByUserId,
   buildAttachmentsByCipherStatement as buildStoredAttachmentsByCipherStatement,
   buildAttachmentsDeleteForCipherStatement as buildStoredAttachmentsDeleteForCipherStatement,
+  buildAttachmentMetadataUpdateStatement as buildStoredAttachmentMetadataUpdateStatement,
   parseAttachmentRows as parseStoredAttachmentRows,
   saveAttachment as saveStoredAttachment,
   updateCipherRevisionDate as updateStoredCipherRevisionDate,
@@ -191,6 +193,10 @@ export class StorageService {
   private static lastAttachmentTokenCleanupAt = 0;
   private static lastTotpReplayCleanupAt = 0;
   private static readonly MAX_D1_SQL_VARIABLES = 100;
+  // Keep each cipher update batch comfortably below D1's per-batch statement
+  // limits. Attachment rows beyond this size run in follow-up batches that use
+  // the same cipher version guard.
+  private static readonly MAX_ATTACHMENT_UPDATES_PER_BATCH = 50;
 
   private static readonly REFRESH_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.refreshTokenCleanupIntervalMs;
   private static readonly ATTACHMENT_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.attachmentTokenCleanupIntervalMs;
@@ -511,24 +517,39 @@ export class StorageService {
   }
 
   /**
-   * D1-201 / D1-203 / D1-301: runs the conditional cipher UPDATE, the
-   * conditional user revision upsert and (optionally) the attachment snapshot
-   * read in a single `db.batch()`, so one save costs one D1 round trip on the
-   * write side. The revision statement only takes effect when the UPDATE
+   * D1-201 / D1-202 / D1-203 / D1-301 / D1-303: runs the conditional cipher
+   * UPDATE, the conditional user revision upsert and attachment metadata
+   * updates in a single `db.batch()`, so one save costs one D1 round trip on
+   * the write side. The revision statement only takes effect when the UPDATE
    * matched (its EXISTS clause checks the updated-at the UPDATE just wrote),
    * and the read-back returns the revision value SQL actually stored so
    * notifications never announce a stamp older than the stored one.
-   * When `updated` is false the revision is the untouched previous value.
+   *
+   * Attachment updates carry the same version guard. When the caller already
+   * has an attachment snapshot it can pass it in (`attachments`) together with
+   * the rows that changed (`attachmentUpdates`); the snapshot is then reused
+   * for the response and no extra read-back statement is queued.
+   * When `updated` is false the revision is the untouched previous value and
+   * no attachment shard beyond the first runs.
    */
   async updateCipherAndRevisionIfUnchanged(
     cipher: Cipher,
     expectedUpdatedAt: string,
     revisionDate: string,
-    options: { includeAttachments?: boolean } = {}
+    options: {
+      includeAttachments?: boolean;
+      attachments?: Attachment[];
+      attachmentUpdates?: Attachment[];
+    } = {}
   ): Promise<{ updated: boolean; attachments: Attachment[]; revisionDate: string }> {
     const includeAttachments = options.includeAttachments !== false;
+    const providedAttachments = options.attachments;
+    const attachmentUpdates = options.attachmentUpdates ?? [];
+    const shouldReadAttachments = includeAttachments && providedAttachments === undefined;
     const revisionMs = Date.parse(revisionDate);
     const cipherGuard = 'SELECT 1 FROM ciphers WHERE id = ? AND user_id = ? AND updated_at = ?';
+    const firstAttachmentUpdates = attachmentUpdates.slice(0, StorageService.MAX_ATTACHMENT_UPDATES_PER_BATCH);
+    const remainingAttachmentUpdates = attachmentUpdates.slice(StorageService.MAX_ATTACHMENT_UPDATES_PER_BATCH);
     const statements: D1PreparedStatement[] = [
       buildStoredCipherUpdateStatement(this.db, this.safeBind.bind(this), cipher, expectedUpdatedAt),
       buildStoredRevisionUpsertIfStatement(
@@ -540,9 +561,18 @@ export class StorageService {
         cipher.userId,
         cipher.updatedAt
       ),
+      ...firstAttachmentUpdates.map((attachment) =>
+        buildStoredAttachmentMetadataUpdateStatement(
+          this.db,
+          this.safeBind.bind(this),
+          attachment,
+          cipher.userId,
+          cipher.updatedAt
+        )
+      ),
     ];
     let attachmentsResultIndex = -1;
-    if (includeAttachments) {
+    if (shouldReadAttachments) {
       statements.push(buildStoredAttachmentsByCipherStatement(this.db, cipher.id));
       attachmentsResultIndex = statements.length - 1;
     }
@@ -551,10 +581,34 @@ export class StorageService {
 
     const results = await this.db.batch(statements);
     const updated = (results[0]?.meta?.changes ?? 0) === 1;
-    const attachments = includeAttachments
-      ? parseStoredAttachmentRows(results[attachmentsResultIndex]?.results as any[] | undefined)
-      : [];
+    const attachments = providedAttachments
+      ?? (shouldReadAttachments
+        ? parseStoredAttachmentRows(results[attachmentsResultIndex]?.results as any[] | undefined)
+        : []);
     const revisionRow = results[revisionResultIndex]?.results?.[0] as { revision_date?: string } | undefined;
+    if (!updated) {
+      return { updated: false, attachments, revisionDate: revisionRow?.revision_date ?? revisionDate };
+    }
+
+    // Large attachment sets are split into follow-up batches. Each shard is
+    // atomic; if one fails the remaining shards stay unprocessed and the caller
+    // reports the failure rather than pretending the save fully succeeded.
+    for (let i = 0; i < remainingAttachmentUpdates.length; i += StorageService.MAX_ATTACHMENT_UPDATES_PER_BATCH) {
+      await this.db.batch(
+        remainingAttachmentUpdates
+          .slice(i, i + StorageService.MAX_ATTACHMENT_UPDATES_PER_BATCH)
+          .map((attachment) =>
+            buildStoredAttachmentMetadataUpdateStatement(
+              this.db,
+              this.safeBind.bind(this),
+              attachment,
+              cipher.userId,
+              cipher.updatedAt
+            )
+          )
+      );
+    }
+
     return { updated, attachments, revisionDate: revisionRow?.revision_date ?? revisionDate };
   }
 
@@ -598,24 +652,24 @@ export class StorageService {
     await deleteStoredCipher(this.db, id, userId);
   }
 
-  async bulkSoftDeleteCiphers(ids: string[], userId: string): Promise<string | null> {
-    return softDeleteStoredCiphers(this.db, this.sqlChunkSize.bind(this), this.updateRevisionDate.bind(this), ids, userId);
+  async bulkSoftDeleteCiphers(ids: string[], userId: string): Promise<BulkCipherMutationResult> {
+    return softDeleteStoredCiphers(this.db, this.sqlChunkSize.bind(this), ids, userId);
   }
 
-  async bulkRestoreCiphers(ids: string[], userId: string): Promise<string | null> {
-    return restoreStoredCiphers(this.db, this.sqlChunkSize.bind(this), this.updateRevisionDate.bind(this), ids, userId);
+  async bulkRestoreCiphers(ids: string[], userId: string): Promise<BulkCipherMutationResult> {
+    return restoreStoredCiphers(this.db, this.sqlChunkSize.bind(this), ids, userId);
   }
 
-  async bulkArchiveCiphers(ids: string[], userId: string): Promise<string | null> {
-    return archiveStoredCiphers(this.db, this.sqlChunkSize.bind(this), this.updateRevisionDate.bind(this), ids, userId);
+  async bulkArchiveCiphers(ids: string[], userId: string): Promise<BulkCipherMutationResult> {
+    return archiveStoredCiphers(this.db, this.sqlChunkSize.bind(this), ids, userId);
   }
 
-  async bulkUnarchiveCiphers(ids: string[], userId: string): Promise<string | null> {
-    return unarchiveStoredCiphers(this.db, this.sqlChunkSize.bind(this), this.updateRevisionDate.bind(this), ids, userId);
+  async bulkUnarchiveCiphers(ids: string[], userId: string): Promise<BulkCipherMutationResult> {
+    return unarchiveStoredCiphers(this.db, this.sqlChunkSize.bind(this), ids, userId);
   }
 
-  async bulkDeleteCiphers(ids: string[], userId: string): Promise<string | null> {
-    return deleteStoredCiphers(this.db, this.sqlChunkSize.bind(this), this.updateRevisionDate.bind(this), ids, userId);
+  async bulkDeleteCiphers(ids: string[], userId: string): Promise<BulkCipherMutationResult> {
+    return deleteStoredCiphers(this.db, this.sqlChunkSize.bind(this), ids, userId);
   }
 
   async getAllCiphers(userId: string): Promise<Cipher[]> {
@@ -630,8 +684,8 @@ export class StorageService {
     return listStoredCiphersByIds(this.db, this.sqlChunkSize.bind(this), ids, userId);
   }
 
-  async bulkMoveCiphers(ids: string[], folderId: string | null, userId: string): Promise<string | null> {
-    return moveStoredCiphers(this.db, this.sqlChunkSize.bind(this), this.updateRevisionDate.bind(this), ids, folderId, userId);
+  async bulkMoveCiphers(ids: string[], folderId: string | null, userId: string): Promise<BulkCipherMutationResult> {
+    return moveStoredCiphers(this.db, this.sqlChunkSize.bind(this), ids, folderId, userId);
   }
 
   // --- Folders ---

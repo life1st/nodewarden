@@ -14,7 +14,7 @@ import {
   PasswordHistory,
 } from '../types';
 import { StorageService } from '../services/storage';
-import { isCipherWriteUnchanged } from '../services/storage-cipher-repo';
+import { isCipherWriteUnchanged, type BulkCipherMutationResult } from '../services/storage-cipher-repo';
 import {
   notifyUserCipherCreate,
   notifyUserCipherDelete,
@@ -24,7 +24,7 @@ import {
 } from '../durable/notifications-hub';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
-import { deleteAllAttachmentsForCiphers, deleteAttachmentBlobs } from './attachments';
+import { deleteAttachmentBlobs } from './attachments';
 import { parsePagination, encodeContinuationToken } from '../utils/pagination';
 import { readActingDeviceIdentifier } from '../utils/device';
 import { auditRequestMetadata, writeAuditEvent } from '../services/audit-events';
@@ -62,6 +62,26 @@ const CIPHER_CONFLICT_MESSAGE = 'The client copy of this cipher is out of date. 
 
 function cipherConflictResponse(): Response {
   return errorResponse(CIPHER_CONFLICT_MESSAGE, 409);
+}
+
+// D1-204: a bulk request that stopped mid-way still reports how many items were
+// committed, so the client can tell the user which part of the selection took
+// effect instead of showing a generic failure.
+function bulkCipherFailureResponse(result: BulkCipherMutationResult): Response {
+  const message = `Bulk operation stopped after ${result.completedCount} of ${result.totalCount} items.`;
+  return jsonResponse(
+    {
+      error: message,
+      error_description: message,
+      completedCount: result.completedCount,
+      totalCount: result.totalCount,
+      ErrorModel: {
+        Message: message,
+        Object: 'error',
+      },
+    },
+    500
+  );
 }
 
 // Per-cipher monotonic stamp: a write that lands in the same millisecond as
@@ -676,27 +696,31 @@ function readIncomingAttachmentMetadata(source: any): IncomingAttachmentMetadata
   return [...merged.values()];
 }
 
-async function syncIncomingAttachmentMetadata(
-  storage: StorageService,
+/**
+ * D1-202: merges embedded attachment metadata into the snapshot read before
+ * the cipher batch and returns only the rows that actually changed. The caller
+ * hands those rows to storage so their UPDATE statements travel in the same
+ * transaction as the cipher and revision writes.
+ */
+function applyIncomingAttachmentMetadata(
   cipherData: any,
   attachments: Attachment[]
-): Promise<void> {
+): { attachments: Attachment[]; changed: Attachment[] } {
   const incoming = readIncomingAttachmentMetadata(cipherData);
-  if (!incoming.length) return;
+  if (!incoming.length) return { attachments, changed: [] };
 
-  // The caller already fetched this snapshot (it is also what the response
-  // renders), so the merge mutates it in place instead of re-reading D1.
   const currentById = new Map(attachments.map((attachment) => [attachment.id, attachment]));
+  const changed: Attachment[] = [];
   for (const item of incoming) {
     const attachment = currentById.get(item.id);
     if (!attachment) continue;
 
-    let changed = false;
+    let changedAttachment = false;
     if (item.hasFileName) {
       const fileName = String(item.fileName || '').trim();
       if (isValidEncString(fileName) && fileName !== attachment.fileName) {
         attachment.fileName = fileName;
-        changed = true;
+        changedAttachment = true;
       }
     }
 
@@ -704,7 +728,7 @@ async function syncIncomingAttachmentMetadata(
       const key = optionalEncString(item.key);
       if (key !== attachment.key) {
         attachment.key = key;
-        changed = true;
+        changedAttachment = true;
       }
     }
 
@@ -713,14 +737,14 @@ async function syncIncomingAttachmentMetadata(
       if (Number.isFinite(size) && size >= 0 && size !== Number(attachment.size || 0)) {
         attachment.size = size;
         attachment.sizeName = formatAttachmentSize(size);
-        changed = true;
+        changedAttachment = true;
       }
     }
 
-    if (changed) {
-      await storage.saveAttachment(attachment);
-    }
+    if (changedAttachment) changed.push(attachment);
   }
+
+  return { attachments, changed };
 }
 
 export function applyCipherEmbeddedAttachmentMetadata(cipherData: any, attachments: Attachment[]): Attachment[] {
@@ -1146,27 +1170,40 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
   // change attachment metadata always take the write path, because that change
   // lives outside the cipher row.
   const incomingAttachmentMetadata = readIncomingAttachmentMetadata(cipherData);
-  const changesAttachmentMetadata = incomingAttachmentMetadata.some(
+  const hasIncomingAttachmentMetadata = incomingAttachmentMetadata.some(
     (item) => item.hasFileName || item.hasKey || item.hasFileSize
   );
-  if (!changesAttachmentMetadata && isCipherWriteUnchanged(cipher, existingCipher)) {
-    const attachments = await storage.getAttachmentsByCipher(existingCipher.id);
+  let attachmentSnapshot: Attachment[] | undefined;
+  let attachmentUpdates: Attachment[] = [];
+  if (hasIncomingAttachmentMetadata) {
+    // D1-202: read the snapshot once, merge the embedded metadata into it and
+    // let the changed rows travel with the cipher batch. The snapshot is also
+    // what the response renders, so no second read is needed afterwards.
+    const snapshot = await storage.getAttachmentsByCipher(existingCipher.id);
+    const merged = applyIncomingAttachmentMetadata(cipherData, snapshot);
+    attachmentSnapshot = merged.attachments;
+    attachmentUpdates = merged.changed;
+  }
+  if (attachmentUpdates.length === 0 && isCipherWriteUnchanged(cipher, existingCipher)) {
+    const attachments = attachmentSnapshot ?? await storage.getAttachmentsByCipher(existingCipher.id);
     return jsonResponse(cipherToResponse(existingCipher, attachments, responseOptions));
   }
 
-  // D1-201 / D1-301: cipher update, conditional revision bump and the
-  // attachment snapshot for the response travel in one batch (one D1 round
-  // trip); the returned revisionDate is the value SQL actually stored.
+  // D1-201 / D1-202 / D1-203 / D1-301: cipher update, conditional revision
+  // bump, attachment metadata updates and the response snapshot travel in one
+  // batch (one D1 round trip); the returned revisionDate is the value SQL
+  // actually stored.
   const { updated, attachments, revisionDate } = await storage.updateCipherAndRevisionIfUnchanged(
     cipher,
     existingCipher.updatedAt,
-    new Date().toISOString()
+    new Date().toISOString(),
+    attachmentSnapshot
+      ? { attachments: attachmentSnapshot, attachmentUpdates }
+      : undefined
   );
   if (!updated) {
     return cipherConflictResponse();
   }
-  // Rejected updates must not modify attachment metadata either.
-  await syncIncomingAttachmentMetadata(storage, cipherData, attachments);
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyCipherUpdateForRequest(request, env, cipher, revisionDate);
 
@@ -1391,9 +1428,12 @@ export async function handleBulkMoveCiphers(request: Request, env: Env, userId: 
     if (!folderOk) return errorResponse('Folder not found', 404);
   }
 
-  const revisionDate = await storage.bulkMoveCiphers(body.ids, folderId, userId);
-  if (revisionDate) {
-    notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  const result = await storage.bulkMoveCiphers(body.ids, folderId, userId);
+  if (result.revisionDate) {
+    notifyVaultSyncForRequest(request, env, userId, result.revisionDate);
+  }
+  if (result.failed) {
+    return bulkCipherFailureResponse(result);
   }
 
   return new Response(null, { status: 204 });
@@ -1499,10 +1539,13 @@ export async function handleBulkArchiveCiphers(request: Request, env: Env, userI
     return errorResponse('ids array is required', 400);
   }
 
-  const revisionDate = await storage.bulkArchiveCiphers(ids, userId);
-  if (revisionDate) {
-    notifyVaultSyncForRequest(request, env, userId, revisionDate);
-    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+  const result = await storage.bulkArchiveCiphers(ids, userId);
+  if (result.revisionDate) {
+    notifyVaultSyncForRequest(request, env, userId, result.revisionDate);
+    notifyUserCiphersSync(env, userId, result.revisionDate, readActingDeviceIdentifier(request));
+  }
+  if (result.failed) {
+    return bulkCipherFailureResponse(result);
   }
 
   return buildCipherListResponse(request, storage, userId, ids);
@@ -1524,10 +1567,13 @@ export async function handleBulkUnarchiveCiphers(request: Request, env: Env, use
     return errorResponse('ids array is required', 400);
   }
 
-  const revisionDate = await storage.bulkUnarchiveCiphers(ids, userId);
-  if (revisionDate) {
-    notifyVaultSyncForRequest(request, env, userId, revisionDate);
-    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+  const result = await storage.bulkUnarchiveCiphers(ids, userId);
+  if (result.revisionDate) {
+    notifyVaultSyncForRequest(request, env, userId, result.revisionDate);
+    notifyUserCiphersSync(env, userId, result.revisionDate, readActingDeviceIdentifier(request));
+  }
+  if (result.failed) {
+    return bulkCipherFailureResponse(result);
   }
 
   return buildCipherListResponse(request, storage, userId, ids);
@@ -1548,10 +1594,15 @@ export async function handleBulkDeleteCiphers(request: Request, env: Env, userId
     return errorResponse('ids array is required', 400);
   }
 
-  const revisionDate = await storage.bulkSoftDeleteCiphers(body.ids, userId);
-  if (revisionDate) {
-    notifyVaultSyncForRequest(request, env, userId, revisionDate);
-    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+  const result = await storage.bulkSoftDeleteCiphers(body.ids, userId);
+  if (result.revisionDate) {
+    notifyVaultSyncForRequest(request, env, userId, result.revisionDate);
+    notifyUserCiphersSync(env, userId, result.revisionDate, readActingDeviceIdentifier(request));
+  }
+  if (result.failed) {
+    return bulkCipherFailureResponse(result);
+  }
+  if (result.revisionDate) {
     await writeCipherAudit(storage, request, userId, 'cipher.delete.soft.bulk', {
       count: body.ids.length,
     });
@@ -1575,10 +1626,13 @@ export async function handleBulkRestoreCiphers(request: Request, env: Env, userI
     return errorResponse('ids array is required', 400);
   }
 
-  const revisionDate = await storage.bulkRestoreCiphers(body.ids, userId);
-  if (revisionDate) {
-    notifyVaultSyncForRequest(request, env, userId, revisionDate);
-    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+  const result = await storage.bulkRestoreCiphers(body.ids, userId);
+  if (result.revisionDate) {
+    notifyVaultSyncForRequest(request, env, userId, result.revisionDate);
+    notifyUserCiphersSync(env, userId, result.revisionDate, readActingDeviceIdentifier(request));
+  }
+  if (result.failed) {
+    return bulkCipherFailureResponse(result);
   }
 
   return buildCipherListResponse(request, storage, userId, body.ids);
@@ -1610,12 +1664,21 @@ export async function handleBulkPermanentDeleteCiphers(request: Request, env: En
     return new Response(null, { status: 204 });
   }
 
-  await deleteAllAttachmentsForCiphers(env, ownedIds);
-
-  const revisionDate = await storage.bulkDeleteCiphers(ownedIds, userId);
-  if (revisionDate) {
-    notifyVaultSyncForRequest(request, env, userId, revisionDate);
-    notifyUserCiphersSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+  const attachmentsByCipher = await storage.getAttachmentsByCipherIds(ownedIds);
+  const result = await storage.bulkDeleteCiphers(ownedIds, userId);
+  if (result.completedCount > 0) {
+    for (const cipherId of ownedIds.slice(0, result.completedCount)) {
+      await deleteAttachmentBlobs(env, cipherId, attachmentsByCipher.get(cipherId) ?? []);
+    }
+  }
+  if (result.revisionDate) {
+    notifyVaultSyncForRequest(request, env, userId, result.revisionDate);
+    notifyUserCiphersSync(env, userId, result.revisionDate, readActingDeviceIdentifier(request));
+  }
+  if (result.failed) {
+    return bulkCipherFailureResponse(result);
+  }
+  if (result.revisionDate) {
     await writeCipherAudit(storage, request, userId, 'cipher.delete.permanent.bulk', {
       count: ownedIds.length,
       requestedCount: ids.length,

@@ -55,6 +55,38 @@ export async function saveAttachment(db: D1Database, safeBind: SafeBind, attachm
   await safeBind(stmt, attachment.id, attachment.cipherId, attachment.fileName, attachment.size, attachment.sizeName, attachment.key).run();
 }
 
+/**
+ * D1-202: attachment metadata update that runs in the same batch as the
+ * conditional cipher UPDATE. The EXISTS guard uses the updated-at value the
+ * cipher UPDATE is about to write, so a losing conditional update leaves the
+ * attachment rows untouched even when the statements are queued together.
+ */
+export function buildAttachmentMetadataUpdateStatement(
+  db: D1Database,
+  safeBind: SafeBind,
+  attachment: Attachment,
+  userId: string,
+  expectedCipherUpdatedAt: string
+): D1PreparedStatement {
+  return safeBind(
+    db.prepare(
+      'UPDATE attachments SET file_name=?, size=?, size_name=?, key=? ' +
+        'WHERE id=? AND cipher_id=? AND EXISTS (' +
+        'SELECT 1 FROM ciphers WHERE ciphers.id=? AND ciphers.user_id=? AND ciphers.updated_at=?' +
+        ')'
+    ),
+    attachment.fileName,
+    attachment.size,
+    attachment.sizeName,
+    attachment.key,
+    attachment.id,
+    attachment.cipherId,
+    attachment.cipherId,
+    userId,
+    expectedCipherUpdatedAt
+  );
+}
+
 export async function deleteAttachment(db: D1Database, id: string): Promise<void> {
   await db.prepare('DELETE FROM attachments WHERE id = ?').bind(id).run();
 }

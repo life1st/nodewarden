@@ -1,4 +1,5 @@
 import type { Cipher } from '../types';
+import { buildRevisionSelectStatement, buildRevisionUpsertStatement } from './storage-revision-repo';
 
 function normalizeOptionalId(value: unknown): string | null {
   if (value == null) return null;
@@ -8,7 +9,13 @@ function normalizeOptionalId(value: unknown): string | null {
 
 type SafeBind = (stmt: D1PreparedStatement, ...values: any[]) => D1PreparedStatement;
 type SqlChunkSize = (fixedBindCount: number) => number;
-type UpdateRevisionDate = (userId: string) => Promise<string>;
+
+export interface BulkCipherMutationResult {
+  revisionDate: string | null;
+  completedCount: number;
+  totalCount: number;
+  failed: boolean;
+}
 
 interface CipherRow {
   id: string;
@@ -219,24 +226,94 @@ export function buildCipherDeleteStatement(
     .bind(id, userId, expectedUpdatedAt);
 }
 
+type BuildBulkChunkStatement = (chunk: string[], placeholders: string, now: string) => D1PreparedStatement;
+type BuildBulkPrecedingStatements = (chunk: string[], placeholders: string, now: string) => D1PreparedStatement[];
+
+// D1 limit is enforced per statement, while `db.batch()` lets several
+// statements travel in one round trip. Keeping the whole bulk in one batch
+// (when it fits) turns the request count from linear in the selection size into
+// a small constant; oversized bulks are split by statement count.
+const MAX_D1_BATCH_STATEMENTS = 100;
+const BULK_REVISION_STATEMENTS = 2;
+
+/**
+ * D1-204: executes a bulk cipher mutation and its revision bump chunk by
+ * chunk. Each chunk runs in one `db.batch()`, so a failure rolls back exactly
+ * that chunk and stops the remaining ones. The caller receives how many items
+ * were processed before the failure so it can report a partial result.
+ */
+async function runBulkCipherMutation(
+  db: D1Database,
+  sqlChunkSize: SqlChunkSize,
+  ids: string[],
+  userId: string,
+  fixedBindCount: number,
+  buildStatement: BuildBulkChunkStatement,
+  options: {
+    precedingStatementsPerChunk?: number;
+    buildPrecedingStatements?: BuildBulkPrecedingStatements;
+  } = {}
+): Promise<BulkCipherMutationResult> {
+  const uniqueIds = sanitizeIds(ids);
+  const totalCount = uniqueIds.length;
+  if (!totalCount) {
+    return { revisionDate: null, completedCount: 0, totalCount: 0, failed: false };
+  }
+
+  const now = new Date().toISOString();
+  const idChunkSize = sqlChunkSize(fixedBindCount);
+  const idChunks: string[][] = [];
+  for (let i = 0; i < uniqueIds.length; i += idChunkSize) {
+    idChunks.push(uniqueIds.slice(i, i + idChunkSize));
+  }
+
+  const statementsPerChunk = 1 + (options.precedingStatementsPerChunk ?? 0);
+  const chunksPerBatch = Math.max(
+    1,
+    Math.floor((MAX_D1_BATCH_STATEMENTS - BULK_REVISION_STATEMENTS) / statementsPerChunk)
+  );
+  let completedCount = 0;
+  let revisionDate: string | null = null;
+
+  for (let i = 0; i < idChunks.length; i += chunksPerBatch) {
+    const group = idChunks.slice(i, i + chunksPerBatch);
+    const batchIds = group.flat();
+    try {
+      const results = await db.batch([
+        ...group.flatMap((chunk) => {
+          const placeholders = chunk.map(() => '?').join(',');
+          return [
+            ...(options.buildPrecedingStatements?.(chunk, placeholders, now) ?? []),
+            buildStatement(chunk, placeholders, now),
+          ];
+        }),
+        buildRevisionUpsertStatement(db, userId, Date.now()),
+        buildRevisionSelectStatement(db, userId),
+      ]);
+      const revisionRow = results[results.length - 1]?.results?.[0] as { revision_date?: string } | undefined;
+      revisionDate = rowRevisionDate(revisionRow) ?? revisionDate;
+      completedCount += batchIds.length;
+    } catch {
+      return { revisionDate, completedCount, totalCount, failed: true };
+    }
+  }
+
+  return { revisionDate, completedCount, totalCount, failed: false };
+}
+
+function rowRevisionDate(row: { revision_date?: string } | undefined): string | null {
+  return row?.revision_date ?? null;
+}
+
+
 export async function bulkSoftDeleteCiphers(
   db: D1Database,
   sqlChunkSize: SqlChunkSize,
-  updateRevisionDate: UpdateRevisionDate,
   ids: string[],
   userId: string
-): Promise<string | null> {
-  if (ids.length === 0) return null;
-  const uniqueIds = sanitizeIds(ids);
-  if (!uniqueIds.length) return null;
-
-  const now = new Date().toISOString();
-  const chunkSize = sqlChunkSize(3);
-
-  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
-    const chunk = uniqueIds.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(',');
-    await db
+): Promise<BulkCipherMutationResult> {
+  return runBulkCipherMutation(db, sqlChunkSize, ids, userId, 3, (chunk, placeholders, now) =>
+    db
       .prepare(
         `UPDATE ciphers
          SET deleted_at = ?, updated_at = ?,
@@ -244,30 +321,17 @@ export async function bulkSoftDeleteCiphers(
          WHERE user_id = ? AND id IN (${placeholders})`
       )
       .bind(now, now, userId, ...chunk)
-      .run();
-  }
-
-  return updateRevisionDate(userId);
+  );
 }
 
 export async function bulkRestoreCiphers(
   db: D1Database,
   sqlChunkSize: SqlChunkSize,
-  updateRevisionDate: UpdateRevisionDate,
   ids: string[],
   userId: string
-): Promise<string | null> {
-  if (ids.length === 0) return null;
-  const uniqueIds = sanitizeIds(ids);
-  if (!uniqueIds.length) return null;
-
-  const now = new Date().toISOString();
-  const chunkSize = sqlChunkSize(2);
-
-  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
-    const chunk = uniqueIds.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(',');
-    await db
+): Promise<BulkCipherMutationResult> {
+  return runBulkCipherMutation(db, sqlChunkSize, ids, userId, 2, (chunk, placeholders, now) =>
+    db
       .prepare(
         `UPDATE ciphers
          SET deleted_at = NULL, updated_at = ?,
@@ -275,31 +339,41 @@ export async function bulkRestoreCiphers(
          WHERE user_id = ? AND id IN (${placeholders})`
       )
       .bind(now, userId, ...chunk)
-      .run();
-  }
-
-  return updateRevisionDate(userId);
+  );
 }
 
 export async function bulkDeleteCiphers(
   db: D1Database,
   sqlChunkSize: SqlChunkSize,
-  updateRevisionDate: UpdateRevisionDate,
   ids: string[],
   userId: string
-): Promise<string | null> {
-  if (ids.length === 0) return null;
-  const uniqueIds = sanitizeIds(ids);
-  if (!uniqueIds.length) return null;
-
-  const chunkSize = sqlChunkSize(1);
-  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
-    const chunk = uniqueIds.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(',');
-    await db.prepare(`DELETE FROM ciphers WHERE user_id = ? AND id IN (${placeholders})`).bind(userId, ...chunk).run();
-  }
-
-  return updateRevisionDate(userId);
+): Promise<BulkCipherMutationResult> {
+  return runBulkCipherMutation(
+    db,
+    sqlChunkSize,
+    ids,
+    userId,
+    1,
+    (chunk, placeholders) =>
+      db.prepare(`DELETE FROM ciphers WHERE user_id = ? AND id IN (${placeholders})`).bind(userId, ...chunk),
+    {
+      precedingStatementsPerChunk: 1,
+      // D1-202 / D1-204: attachment rows share the cipher delete transaction so
+      // a failed chunk cannot leave ciphers without their metadata.
+      buildPrecedingStatements: (chunk, placeholders) => [
+        db
+          .prepare(
+            `DELETE FROM attachments
+             WHERE cipher_id IN (${placeholders})
+               AND EXISTS (
+                 SELECT 1 FROM ciphers
+                 WHERE ciphers.id = attachments.cipher_id AND ciphers.user_id = ?
+               )`
+          )
+          .bind(...chunk, userId),
+      ],
+    }
+  );
 }
 
 export async function getAllCiphers(db: D1Database, userId: string): Promise<Cipher[]> {
@@ -369,21 +443,13 @@ export async function getCiphersByIds(
 export async function bulkMoveCiphers(
   db: D1Database,
   sqlChunkSize: SqlChunkSize,
-  updateRevisionDate: UpdateRevisionDate,
   ids: string[],
   folderId: string | null,
   userId: string
-): Promise<string | null> {
-  if (ids.length === 0) return null;
-  const now = new Date().toISOString();
+): Promise<BulkCipherMutationResult> {
   const normalizedFolderId = normalizeOptionalId(folderId);
-  const uniqueIds = sanitizeIds(ids);
-  const chunkSize = sqlChunkSize(3);
-
-  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
-    const chunk = uniqueIds.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(',');
-    await db
+  return runBulkCipherMutation(db, sqlChunkSize, ids, userId, 3, (chunk, placeholders, now) =>
+    db
       .prepare(
         `UPDATE ciphers
          SET folder_id = ?, updated_at = ?,
@@ -391,30 +457,17 @@ export async function bulkMoveCiphers(
          WHERE user_id = ? AND id IN (${placeholders})`
       )
       .bind(normalizedFolderId, now, userId, ...chunk)
-      .run();
-  }
-
-  return updateRevisionDate(userId);
+  );
 }
 
 export async function bulkArchiveCiphers(
   db: D1Database,
   sqlChunkSize: SqlChunkSize,
-  updateRevisionDate: UpdateRevisionDate,
   ids: string[],
   userId: string
-): Promise<string | null> {
-  if (ids.length === 0) return null;
-  const uniqueIds = sanitizeIds(ids);
-  if (!uniqueIds.length) return null;
-
-  const now = new Date().toISOString();
-  const chunkSize = sqlChunkSize(3);
-
-  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
-    const chunk = uniqueIds.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(',');
-    await db
+): Promise<BulkCipherMutationResult> {
+  return runBulkCipherMutation(db, sqlChunkSize, ids, userId, 3, (chunk, placeholders, now) =>
+    db
       .prepare(
         `UPDATE ciphers
          SET archived_at = ?, updated_at = ?,
@@ -425,30 +478,17 @@ export async function bulkArchiveCiphers(
            AND json_extract(data, '$.deletedDate') IS NULL`
       )
       .bind(now, now, userId, ...chunk)
-      .run();
-  }
-
-  return updateRevisionDate(userId);
+  );
 }
 
 export async function bulkUnarchiveCiphers(
   db: D1Database,
   sqlChunkSize: SqlChunkSize,
-  updateRevisionDate: UpdateRevisionDate,
   ids: string[],
   userId: string
-): Promise<string | null> {
-  if (ids.length === 0) return null;
-  const uniqueIds = sanitizeIds(ids);
-  if (!uniqueIds.length) return null;
-
-  const now = new Date().toISOString();
-  const chunkSize = sqlChunkSize(2);
-
-  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
-    const chunk = uniqueIds.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(',');
-    await db
+): Promise<BulkCipherMutationResult> {
+  return runBulkCipherMutation(db, sqlChunkSize, ids, userId, 2, (chunk, placeholders, now) =>
+    db
       .prepare(
         `UPDATE ciphers
          SET archived_at = NULL, updated_at = ?,
@@ -456,8 +496,5 @@ export async function bulkUnarchiveCiphers(
          WHERE user_id = ? AND id IN (${placeholders})`
       )
       .bind(now, userId, ...chunk)
-      .run();
-  }
-
-  return updateRevisionDate(userId);
+  );
 }
