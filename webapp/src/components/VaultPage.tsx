@@ -120,6 +120,7 @@ export default function VaultPage(props: VaultPageProps) {
   const [syncing, setSyncing] = useState(false);
   const [repromptVerifying, setRepromptVerifying] = useState(false);
   const [failedMutation, setFailedMutation] = useState<{ kind: MutationKind; cipherId: string } | null>(null);
+  const [slowSave, setSlowSave] = useState(false);
   const writeState = useWriteQueueState(VAULT_WRITE_KEY);
   const [repromptOpen, setRepromptOpen] = useState(false);
   const [repromptPassword, setRepromptPassword] = useState('');
@@ -657,6 +658,17 @@ export default function VaultPage(props: VaultPageProps) {
     : failedMutation?.kind === 'save' && failedMutation.cipherId === draftTargetId
       ? 'error'
       : null;
+
+  // D1-403: warn when a save takes long enough that the user may think the
+  // page is stuck. The flag resets as soon as the write settles.
+  useEffect(() => {
+    if (!isSavingCurrentDraft) {
+      setSlowSave(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setSlowSave(true), 2000);
+    return () => window.clearTimeout(timer);
+  }, [isSavingCurrentDraft, draftTargetId]);
 
   // A new write invalidates the previous failure hint.
   useEffect(() => {
@@ -1353,6 +1365,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
                 isCreating={isCreating}
                 busy={isSavingCurrentDraft}
                 saveStatus={saveStatus}
+                savingSlow={slowSave}
                 folders={props.folders}
                 folderSortMode={folderSortMode}
                 selectedCipher={selectedCipher}

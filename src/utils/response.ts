@@ -141,17 +141,24 @@ export function jsonResponse(data: any, status: number = 200, headers: Record<st
 }
 
 // Error response helper
-export function errorResponse(message: string, status: number = 400): Response {
+export function errorResponse(
+  message: string,
+  status: number = 400,
+  options: { code?: string; headers?: Record<string, string> } = {}
+): Response {
   return jsonResponse(
     {
       error: message,
       error_description: message,
+      ...(options.code ? { code: options.code } : {}),
       ErrorModel: {
         Message: message,
         Object: 'error',
+        ...(options.code ? { Code: options.code } : {}),
       },
     },
-    status
+    status,
+    options.headers
   );
 }
 

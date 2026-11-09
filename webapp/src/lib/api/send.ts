@@ -1,6 +1,6 @@
 import { base64ToBytes, bytesToBase64, decryptBw, decryptBwFileData, decryptStr, encryptBw, encryptBwFileData, hkdf, pbkdf2 } from '../crypto';
 import type { Send, SendDraft, SessionState } from '../types';
-import { chunkArray, createApiError, parseErrorMessage, parseJson, uploadDirectEncryptedPayload, type AuthedFetch } from './shared';
+import { apiErrorFromResponse, chunkArray, createApiError, parseErrorMessage, parseJson, uploadDirectEncryptedPayload, type AuthedFetch } from './shared';
 
 function toIsoDateFromDays(value: string, required: boolean): string | null {
   const raw = String(value || '').trim();
@@ -126,7 +126,7 @@ export async function createSend(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Create send failed'));
+    if (!resp.ok) throw await apiErrorFromResponse(resp, 'Create send failed');
     const body = await parseJson<Send>(resp);
     if (!body?.id) throw new Error('Create send failed');
     return body;
@@ -158,7 +158,7 @@ export async function createSend(
       expirationDate: expirationIso,
     }),
   });
-  if (!fileResp.ok) throw new Error(await parseErrorMessage(fileResp, 'Create file send failed'));
+  if (!fileResp.ok) throw await apiErrorFromResponse(fileResp, 'Create file send failed');
 
   const uploadInfo = await parseJson<{ url?: string; sendResponse?: Send; fileUploadType?: number }>(fileResp);
   const uploadUrl = uploadInfo?.url;
@@ -174,7 +174,7 @@ export async function createSend(
     unsupportedMessage: 'Unsupported send upload type',
     onProgress,
   });
-  if (!uploadResp.ok) throw new Error(await parseErrorMessage(uploadResp, 'Upload send file failed'));
+  if (!uploadResp.ok) throw await apiErrorFromResponse(uploadResp, 'Upload send file failed');
   if (!uploadInfo?.sendResponse?.id) throw new Error('Create file send failed');
   return uploadInfo.sendResponse;
 }
@@ -230,7 +230,7 @@ export async function updateSend(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Update send failed'));
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Update send failed');
   const body = await parseJson<Send>(resp);
   if (!body?.id) throw new Error('Update send failed');
   return body;
@@ -238,7 +238,7 @@ export async function updateSend(
 
 export async function deleteSend(authedFetch: AuthedFetch, sendId: string): Promise<void> {
   const resp = await authedFetch(`/api/sends/${encodeURIComponent(sendId)}`, { method: 'DELETE' });
-  if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Delete send failed'));
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Delete send failed');
 }
 
 export async function bulkDeleteSends(authedFetch: AuthedFetch, ids: string[]): Promise<void> {
@@ -249,7 +249,7 @@ export async function bulkDeleteSends(authedFetch: AuthedFetch, ids: string[]): 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: chunk }),
     });
-    if (!resp.ok) throw new Error('Bulk delete sends failed');
+    if (!resp.ok) throw await apiErrorFromResponse(resp, 'Bulk delete sends failed');
   }
 }
 

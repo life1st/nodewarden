@@ -4,6 +4,7 @@ import { BackupTransferRunner } from './durable/backup-transfer-runner';
 import { handleRequest } from './router';
 import { StorageService } from './services/storage';
 import { applyCors, jsonResponse } from './utils/response';
+import { getD1ErrorCode, getD1RetryAfterSeconds } from './utils/d1-errors';
 import { runScheduledBackupIfDue } from './handlers/backup';
 import {
   isBackendRequestPath,
@@ -94,16 +95,28 @@ export default {
     if (dbInitError) {
       // Log full error server-side, return generic message to client.
       console.error('DB init error (not forwarded to client):', dbInitError);
+      // D1-401: an overloaded/unavailable database during bootstrap is a
+      // transient outage, not a permanent application failure.
+      const d1ErrorCode = getD1ErrorCode(dbInitError);
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (d1ErrorCode) headers['Retry-After'] = String(getD1RetryAfterSeconds(dbInitError));
       const resp = jsonResponse(
         {
-          error: 'Database not initialized',
-          error_description: 'Database initialization failed. Check server logs for details.',
+          error: d1ErrorCode ? 'Service temporarily unavailable' : 'Database not initialized',
+          error_description: d1ErrorCode
+            ? 'Service temporarily unavailable'
+            : 'Database initialization failed. Check server logs for details.',
+          ...(d1ErrorCode ? { code: d1ErrorCode } : {}),
           ErrorModel: {
             Message: 'Service temporarily unavailable',
             Object: 'error',
+            ...(d1ErrorCode ? { Code: d1ErrorCode } : {}),
           },
         },
-        500
+        d1ErrorCode ? 503 : 500,
+        headers
       );
       return applyCors(normalizedRequest, resp, env);
     }

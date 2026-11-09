@@ -32,6 +32,7 @@ interface VaultEditorProps {
   isCreating: boolean;
   busy: boolean;
   saveStatus?: 'queued' | 'running' | 'error' | null;
+  savingSlow?: boolean;
   folders: Folder[];
   folderSortMode: VaultSortMode;
   selectedCipher: Cipher | null;
@@ -993,6 +994,7 @@ export default function VaultEditor(props: VaultEditorProps) {
           </button>
         )}
       </div>
+      {props.savingSlow && <div className="save-slow-hint" role="status">{t('txt_saving_slow')}</div>}
       {props.localError && <div className="local-error">{props.localError}</div>}
       <PasswordGeneratorModal
         open={passwordGeneratorOpen}

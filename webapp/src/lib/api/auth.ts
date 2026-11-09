@@ -520,7 +520,12 @@ export function createAuthedFetch(getSession: () => SessionState | null, setSess
       let lastError: unknown;
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         try {
-          const response = await fetch(input, { ...init, headers });
+          let attemptHeaders = headers;
+          if (attempt > 0 && isRetryableMethod(init.method)) {
+            attemptHeaders = new Headers(headers);
+            attemptHeaders.set('X-NodeWarden-Retry', String(attempt));
+          }
+          const response = await fetch(input, { ...init, headers: attemptHeaders });
           recordNodeWardenReachable();
           if (response.status !== 429 && (response.status < 500 || response.status >= 600)) {
             return response;

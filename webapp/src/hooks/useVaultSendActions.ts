@@ -629,7 +629,11 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
           onNotify('success', t('txt_item_updated'));
         } catch (error) {
           patchCipherBatch([cipher.id], () => previousCipher, { patchEncrypted: false });
-          if (error instanceof Error && error.message === t('txt_item_changed_elsewhere')) {
+          const conflict = !!error && typeof error === 'object' && (
+            (error as { status?: number }).status === 409
+            || (error instanceof Error && error.message === t('txt_item_changed_elsewhere'))
+          );
+          if (conflict) {
             // Fetch the current item for reopening; the editor keeps the draft.
             await refetchCiphers().catch(() => {});
           }

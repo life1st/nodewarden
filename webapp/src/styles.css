@@ -790,6 +790,11 @@ h4 {
   color: var(--danger);
 }
 
+.save-slow-hint {
+  font-size: 0.875rem;
+  color: var(--warning);
+}
+
 .backup-grid {
   grid-template-columns: 260px 280px minmax(0, 1fr);
 }

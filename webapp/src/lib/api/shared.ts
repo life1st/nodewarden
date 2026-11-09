@@ -49,10 +49,52 @@ export async function parseErrorMessage(resp: Response, fallback: string): Promi
   return translateServerError(body?.error_description || body?.error, fallback);
 }
 
-export function createApiError(message: string, status?: number): Error & { status?: number } {
-  const error = new Error(message) as Error & { status?: number };
+export interface ApiError extends Error {
+  status?: number;
+  code?: string;
+  retryAfterMs?: number;
+}
+
+export function createApiError(
+  message: string,
+  status?: number,
+  code?: string,
+  retryAfterMs?: number
+): ApiError {
+  const error = new Error(message) as ApiError;
   if (status !== undefined) error.status = status;
+  if (code) error.code = code;
+  if (retryAfterMs !== undefined) error.retryAfterMs = retryAfterMs;
   return error;
+}
+
+/**
+ * Preserves the HTTP status, server error code and Retry-After value so the UI
+ * can tell transient outages (503), version conflicts (409) and real failures
+ * (500) apart. The thrown message is already user-facing.
+ */
+export async function apiErrorFromResponse(response: Response, fallback: string): Promise<ApiError> {
+  const status = response.status;
+  const retryAfterSeconds = Number(response.headers.get('Retry-After') || 0);
+  const retryAfterMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+    ? retryAfterSeconds * 1000
+    : undefined;
+  const body = await parseJson<{ error?: string; error_description?: string; code?: string; errorCode?: string }>(response);
+  const code = String(body?.code || body?.errorCode || '').trim() || undefined;
+  const serverMessage = body?.error_description || body?.error || '';
+
+  if (status === 503) {
+    return createApiError(t('txt_service_busy_retry'), status, code, retryAfterMs);
+  }
+  if (status === 409) {
+    const translated = translateServerError(serverMessage, '');
+    const message = translated && translated !== serverMessage
+      ? translated
+      : t('txt_conflict_refresh');
+    return createApiError(message, status, code, retryAfterMs);
+  }
+
+  return createApiError(translateServerError(serverMessage, fallback), status, code, retryAfterMs);
 }
 
 export function requiredError(messageKey: string): never {

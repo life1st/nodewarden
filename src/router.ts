@@ -5,6 +5,14 @@ import { handleCors, errorResponse } from './utils/response';
 import { LIMITS } from './config/limits';
 import { handleAuthenticatedRoute } from './router-authenticated';
 import { handlePublicRoute } from './router-public';
+import { getD1ErrorCode, getD1RetryAfterSeconds, getErrorLogMessage } from './utils/d1-errors';
+import {
+  createObservedEnv,
+  createRequestObservabilityContext,
+  logRequestSummary,
+  markRequestUser,
+  withRequestId,
+} from './utils/observability';
 
 function jwtSecretUnsafeReason(env: Env): 'missing' | 'too_short' | null {
   const secret = (env.JWT_SECRET || '').trim();
@@ -101,7 +109,11 @@ async function enforceRequestBodyLimit(
   });
 }
 
-export async function handleRequest(request: Request, env: Env): Promise<Response> {
+async function routeRequest(
+  request: Request,
+  env: Env,
+  requestContext: ReturnType<typeof createRequestObservabilityContext>
+): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
@@ -151,68 +163,107 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return handleCors(request, env);
   }
 
-  try {
-    const bodyLimitResult = await enforceRequestBodyLimit(request, path, method);
-    if (bodyLimitResult instanceof Response) {
-      return bodyLimitResult;
-    }
-    request = bodyLimitResult;
-
-    const secretIssue = jwtSecretUnsafeReason(env);
-    if (secretIssue && !canServeWithUnsafeJwtSecret(path, method)) {
-      return errorResponse('Server configuration error: JWT_SECRET is not set or too weak', 500);
-    }
-
-    const publicResponse = await handlePublicRoute(request, env, path, method, enforcePublicRateLimit);
-    if (publicResponse) return publicResponse;
-
-    const auth = new AuthService(env);
-    const authHeader = request.headers.get('Authorization');
-    const verified = await auth.verifyAccessTokenWithUser(authHeader);
-    if (!verified) {
-      return errorResponse('Unauthorized', 401);
-    }
-    const { payload, user: currentUser } = verified;
-
-    const actingDeviceId = String(payload.did || '').trim();
-    if (actingDeviceId) {
-      const nextHeaders = new Headers(request.headers);
-      nextHeaders.set('X-NodeWarden-Acting-Device-Id', actingDeviceId);
-      request = new Request(request, { headers: nextHeaders });
-    }
-
-    const userId = payload.sub;
-    if (currentUser.status !== 'active') {
-      return errorResponse('Account is disabled', 403);
-    }
-
-    if (!isImportBypassRequest(request, path, method)) {
-      const rateLimit = new RateLimitService(env.DB);
-      const rateLimitCheck = await rateLimit.consumeBudget(`${userId}:api`, LIMITS.rateLimit.apiRequestsPerMinute);
-      if (!rateLimitCheck.allowed) {
-        return new Response(
-          JSON.stringify({
-            error: 'Too many requests',
-            error_description: `Rate limit exceeded. Try again in ${rateLimitCheck.retryAfterSeconds} seconds.`,
-          }),
-          {
-            status: 429,
-            headers: {
-              'Content-Type': 'application/json',
-              'Retry-After': String(rateLimitCheck.retryAfterSeconds || 60),
-              'X-RateLimit-Remaining': '0',
-            },
-          }
-        );
-      }
-    }
-
-    const authenticatedResponse = await handleAuthenticatedRoute(request, env, userId, currentUser, path, method);
-    if (authenticatedResponse) return authenticatedResponse;
-
-    return errorResponse('Not found', 404);
-  } catch (error) {
-    console.error('Request error:', error);
-    return errorResponse('Internal server error', 500);
+  const bodyLimitResult = await enforceRequestBodyLimit(request, path, method);
+  if (bodyLimitResult instanceof Response) {
+    return bodyLimitResult;
   }
+  request = bodyLimitResult;
+
+  const secretIssue = jwtSecretUnsafeReason(env);
+  if (secretIssue && !canServeWithUnsafeJwtSecret(path, method)) {
+    return errorResponse('Server configuration error: JWT_SECRET is not set or too weak', 500);
+  }
+
+  const publicResponse = await handlePublicRoute(request, env, path, method, enforcePublicRateLimit);
+  if (publicResponse) return publicResponse;
+
+  const auth = new AuthService(env);
+  const authHeader = request.headers.get('Authorization');
+  const verified = await auth.verifyAccessTokenWithUser(authHeader);
+  if (!verified) {
+    return errorResponse('Unauthorized', 401);
+  }
+  const { payload, user: currentUser } = verified;
+
+  const actingDeviceId = String(payload.did || '').trim();
+  if (actingDeviceId) {
+    const nextHeaders = new Headers(request.headers);
+    nextHeaders.set('X-NodeWarden-Acting-Device-Id', actingDeviceId);
+    request = new Request(request, { headers: nextHeaders });
+  }
+
+  const userId = payload.sub;
+  markRequestUser(requestContext, userId);
+  if (currentUser.status !== 'active') {
+    return errorResponse('Account is disabled', 403);
+  }
+
+  if (!isImportBypassRequest(request, path, method)) {
+    const rateLimit = new RateLimitService(env.DB);
+    const rateLimitCheck = await rateLimit.consumeBudget(`${userId}:api`, LIMITS.rateLimit.apiRequestsPerMinute);
+    if (!rateLimitCheck.allowed) {
+      return new Response(
+        JSON.stringify({
+          error: 'Too many requests',
+          error_description: `Rate limit exceeded. Try again in ${rateLimitCheck.retryAfterSeconds} seconds.`,
+        }),
+        {
+          status: 429,
+          headers: {
+            'Content-Type': 'application/json',
+            'Retry-After': String(rateLimitCheck.retryAfterSeconds || 60),
+            'X-RateLimit-Remaining': '0',
+          },
+        }
+      );
+    }
+  }
+
+  const authenticatedResponse = await handleAuthenticatedRoute(request, env, userId, currentUser, path, method);
+  if (authenticatedResponse) return authenticatedResponse;
+
+  return errorResponse('Not found', 404);
+}
+
+export async function handleRequest(request: Request, env: Env): Promise<Response> {
+  const requestContext = createRequestObservabilityContext(request);
+  const observedEnv = createObservedEnv(env, requestContext);
+  let errorCode: string | null = null;
+  let response: Response;
+
+  try {
+    response = await routeRequest(request, observedEnv, requestContext);
+  } catch (error) {
+    const d1ErrorCode = getD1ErrorCode(error);
+    const message = getErrorLogMessage(error);
+    if (d1ErrorCode) {
+      errorCode = d1ErrorCode;
+      console.error(
+        JSON.stringify({
+          requestId: requestContext.requestId,
+          event: 'request_error',
+          errorCode,
+          message,
+        })
+      );
+      response = errorResponse('Service temporarily unavailable', 503, {
+        code: d1ErrorCode,
+        headers: { 'Retry-After': String(getD1RetryAfterSeconds(error)) },
+      });
+    } else {
+      errorCode = 'INTERNAL_ERROR';
+      console.error(
+        JSON.stringify({
+          requestId: requestContext.requestId,
+          event: 'request_error',
+          errorCode,
+          message,
+        })
+      );
+      response = errorResponse('Internal server error', 500, { code: errorCode });
+    }
+  }
+
+  logRequestSummary(requestContext, response.status, errorCode);
+  return withRequestId(response, requestContext.requestId);
 }

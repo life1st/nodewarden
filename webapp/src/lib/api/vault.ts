@@ -10,6 +10,7 @@ import type {
 import {
   BULK_API_CHUNK_SIZE,
   chunkArray,
+  apiErrorFromResponse,
   createApiError,
   parseErrorMessage,
   parseJson,
@@ -55,7 +56,7 @@ export async function createFolder(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: encryptedName }),
   });
-  if (!resp.ok) throw new Error('Create folder failed');
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Create folder failed');
   const body = await parseJson<Folder>(resp);
   if (!body?.id) throw new Error('Create folder failed');
   return body;
@@ -74,7 +75,7 @@ export async function deleteFolder(authedFetch: AuthedFetch, folderId: string): 
   const resp = await authedFetch(`/api/folders/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
-  if (!resp.ok) throw new Error('Delete folder failed');
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Delete folder failed');
 }
 
 export async function bulkDeleteFolders(authedFetch: AuthedFetch, ids: string[]): Promise<void> {
@@ -85,7 +86,7 @@ export async function bulkDeleteFolders(authedFetch: AuthedFetch, ids: string[])
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: chunk }),
     });
-    if (!resp.ok) throw new Error('Bulk delete folders failed');
+    if (!resp.ok) throw await apiErrorFromResponse(resp, 'Bulk delete folders failed');
   }
 }
 
@@ -106,7 +107,7 @@ export async function updateFolder(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: encryptedName }),
   });
-  if (!resp.ok) throw new Error('Update folder failed');
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Update folder failed');
   const body = await parseJson<Folder>(resp);
   if (!body?.id) throw new Error('Update folder failed');
   return body;
@@ -158,7 +159,7 @@ export async function importCiphers(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Import failed'));
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Import failed');
   if (!returnCipherMap) return null;
 
   const body =
@@ -258,7 +259,7 @@ export async function uploadCipherAttachment(
       fileSize: encryptedBytes.byteLength,
     }),
   });
-  if (!metaResp.ok) throw new Error(await parseErrorMessage(metaResp, 'Create attachment failed'));
+  if (!metaResp.ok) throw await apiErrorFromResponse(metaResp, 'Create attachment failed');
 
   const meta =
     (await parseJson<{
@@ -287,7 +288,7 @@ export async function uploadCipherAttachment(
     } catch {
       // ignore rollback failure
     }
-    throw new Error(await parseErrorMessage(uploadResp, 'Upload attachment failed'));
+    throw await apiErrorFromResponse(uploadResp, 'Upload attachment failed');
   }
 }
 
@@ -302,7 +303,7 @@ export async function deleteCipherAttachment(
   const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(cid)}/attachment/${encodeURIComponent(aid)}`, {
     method: 'DELETE',
   });
-  if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Delete attachment failed'));
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Delete attachment failed');
 }
 
 export async function repairCipherAttachmentMetadata(
@@ -319,7 +320,7 @@ export async function repairCipherAttachmentMetadata(
       body: JSON.stringify(metadata),
     }
   );
-  if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Update attachment metadata failed'));
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Update attachment metadata failed');
 }
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -394,7 +395,7 @@ async function uploadRepairedAttachmentBlob(
     headers: { 'Content-Type': 'application/octet-stream' },
     body: payload,
   });
-  if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Repair attachment upload failed'));
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Repair attachment upload failed');
 }
 
 export async function downloadCipherAttachmentDecrypted(
@@ -1459,7 +1460,7 @@ export async function createCipher(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!resp.ok) throw new Error('Create item failed');
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Create item failed');
   const body = await parseJson<Cipher>(resp);
   if (!body?.id) throw new Error('Create item failed');
   return body;
@@ -1489,13 +1490,13 @@ export async function updateCipher(
     },
     body: JSON.stringify(payload),
   });
-  if (!resp.ok) throw createApiError(await parseErrorMessage(resp, t('txt_update_item_failed')), resp.status);
+  if (!resp.ok) throw await apiErrorFromResponse(resp, t('txt_update_item_failed'));
   return (await parseJson<Cipher>(resp))!;
 }
 
 export async function deleteCipher(authedFetch: AuthedFetch, cipherId: string): Promise<Cipher> {
   const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(cipherId)}`, { method: 'DELETE' });
-  if (!resp.ok) throw new Error('Delete item failed');
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Delete item failed');
   return (await parseJson<Cipher>(resp))!;
 }
 
@@ -1503,14 +1504,14 @@ export async function permanentDeleteCipher(authedFetch: AuthedFetch, cipherId: 
   const id = String(cipherId || '').trim();
   if (!id) throw new Error('Cipher id is required');
   const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(id)}/delete`, { method: 'DELETE' });
-  if (!resp.ok) throw new Error('Permanent delete item failed');
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Permanent delete item failed');
 }
 
 export async function archiveCipher(authedFetch: AuthedFetch, cipherId: string): Promise<Cipher> {
   const id = String(cipherId || '').trim();
   if (!id) throw new Error('Cipher id is required');
   const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(id)}/archive`, { method: 'PUT' });
-  if (!resp.ok) throw new Error('Archive item failed');
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Archive item failed');
   return (await parseJson<Cipher>(resp))!;
 }
 
@@ -1518,7 +1519,7 @@ export async function unarchiveCipher(authedFetch: AuthedFetch, cipherId: string
   const id = String(cipherId || '').trim();
   if (!id) throw new Error('Cipher id is required');
   const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(id)}/unarchive`, { method: 'PUT' });
-  if (!resp.ok) throw new Error('Unarchive item failed');
+  if (!resp.ok) throw await apiErrorFromResponse(resp, 'Unarchive item failed');
   return (await parseJson<Cipher>(resp))!;
 }
 
@@ -1530,7 +1531,7 @@ export async function bulkDeleteCiphers(authedFetch: AuthedFetch, ids: string[])
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: chunk }),
     });
-    if (!resp.ok) throw new Error('Bulk delete failed');
+    if (!resp.ok) throw await apiErrorFromResponse(resp, 'Bulk delete failed');
   }
 }
 
@@ -1542,7 +1543,7 @@ export async function bulkArchiveCiphers(authedFetch: AuthedFetch, ids: string[]
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: chunk }),
     });
-    if (!resp.ok) throw new Error('Bulk archive failed');
+    if (!resp.ok) throw await apiErrorFromResponse(resp, 'Bulk archive failed');
   }
 }
 
@@ -1554,7 +1555,7 @@ export async function bulkPermanentDeleteCiphers(authedFetch: AuthedFetch, ids: 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: chunk }),
     });
-    if (!resp.ok) throw new Error('Bulk permanent delete failed');
+    if (!resp.ok) throw await apiErrorFromResponse(resp, 'Bulk permanent delete failed');
   }
 }
 
@@ -1566,7 +1567,7 @@ export async function bulkRestoreCiphers(authedFetch: AuthedFetch, ids: string[]
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: chunk }),
     });
-    if (!resp.ok) throw new Error('Bulk restore failed');
+    if (!resp.ok) throw await apiErrorFromResponse(resp, 'Bulk restore failed');
   }
 }
 
@@ -1578,7 +1579,7 @@ export async function bulkUnarchiveCiphers(authedFetch: AuthedFetch, ids: string
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: chunk }),
     });
-    if (!resp.ok) throw new Error('Bulk unarchive failed');
+    if (!resp.ok) throw await apiErrorFromResponse(resp, 'Bulk unarchive failed');
   }
 }
 
@@ -1594,6 +1595,6 @@ export async function bulkMoveCiphers(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: chunk, folderId }),
     });
-    if (!resp.ok) throw new Error('Bulk move failed');
+    if (!resp.ok) throw await apiErrorFromResponse(resp, 'Bulk move failed');
   }
 }
