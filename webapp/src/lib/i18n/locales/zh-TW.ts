@@ -740,6 +740,7 @@ const zhTW: Record<string, string> = {
   "txt_item_created": "項目已建立",
   "txt_item_deleted": "項目已刪除",
   "txt_item_deleted_permanently": "項目已永久刪除",
+  "txt_item_deleted_attachment_cleanup_pending": "項目已刪除，附件清理稍後完成",
   "txt_item_history": "項目歷史",
   "txt_password_history": "密碼歷史記錄",
   "txt_password_updated_value": "密碼更新新於: {value}",

@@ -51,7 +51,7 @@ export async function getSendForUser(db: D1Database, id: string, userId: string)
   return mapSendRow(row);
 }
 
-export async function saveSend(db: D1Database, safeBind: SafeBind, send: Send): Promise<void> {
+export function buildSaveSendStatement(db: D1Database, safeBind: SafeBind, send: Send): D1PreparedStatement {
   const stmt = db.prepare(
     'INSERT INTO sends(id, user_id, type, name, notes, data, key, password_hash, password_salt, password_iterations, auth_type, emails, max_access_count, access_count, disabled, hide_email, created_at, updated_at, expiration_date, deletion_date) ' +
     'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
@@ -63,7 +63,7 @@ export async function saveSend(db: D1Database, safeBind: SafeBind, send: Send): 
     'WHERE user_id=excluded.user_id'
   );
 
-  await safeBind(
+  return safeBind(
     stmt,
     send.id,
     send.userId,
@@ -85,7 +85,11 @@ export async function saveSend(db: D1Database, safeBind: SafeBind, send: Send): 
     send.updatedAt,
     send.expirationDate,
     send.deletionDate
-  ).run();
+  );
+}
+
+export async function saveSend(db: D1Database, safeBind: SafeBind, send: Send): Promise<void> {
+  await buildSaveSendStatement(db, safeBind, send).run();
 }
 
 export async function incrementSendAccessCount(db: D1Database, sendId: string): Promise<boolean> {

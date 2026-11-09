@@ -1,4 +1,4 @@
-import { User, Cipher, Folder, Attachment, Device, Invite, AuditLog, Send, TrustedDeviceTokenSummary, RefreshTokenRecord, CustomEquivalentDomain, AccountPasskeyChallenge, AccountPasskeyChallengeScope, AccountPasskeyCredential, AuthRequestRecord } from '../types';
+import { Env, User, Cipher, Folder, Attachment, Device, Invite, AuditLog, Send, TrustedDeviceTokenSummary, RefreshTokenRecord, CustomEquivalentDomain, AccountPasskeyChallenge, AccountPasskeyChallengeScope, AccountPasskeyCredential, AuthRequestRecord } from '../types';
 import { LIMITS } from '../config/limits';
 import { ensurePushInstallationCredentials } from './push-relay';
 import { ensureStorageSchema } from './storage-schema';
@@ -45,6 +45,7 @@ import {
   getFolderForUser as findStoredFolderForUser,
   getFoldersPage as listStoredFoldersPage,
   saveFolder as saveStoredFolder,
+  buildSaveFolderStatement as buildStoredSaveFolderStatement,
   updateFolderIfUnchanged as updateStoredFolderIfUnchanged,
 } from './storage-folder-repo';
 import {
@@ -61,6 +62,7 @@ import {
   getCiphersByIds as listStoredCiphersByIds,
   getCiphersPage as listStoredCiphersPage,
   saveCipher as saveStoredCipher,
+  buildCipherInsertStatement as buildStoredCipherInsertStatement,
   updateCipherIfUnchanged as updateStoredCipherIfUnchanged,
   buildCipherUpdateStatement as buildStoredCipherUpdateStatement,
   buildCipherDeleteStatement as buildStoredCipherDeleteStatement,
@@ -95,7 +97,24 @@ import {
   getSendsPage as listStoredSendsPage,
   incrementSendAccessCount as incrementStoredSendAccessCount,
   saveSend as saveStoredSend,
+  buildSaveSendStatement as buildStoredSaveSendStatement,
 } from './storage-send-repo';
+import {
+  type IdempotencyRecord,
+  getIdempotencyRecord as getStoredIdempotencyRecord,
+  saveIdempotencyRecord as saveStoredIdempotencyRecord,
+  deleteIdempotencyRecord as deleteStoredIdempotencyRecord,
+  pruneExpiredIdempotency as pruneStoredExpiredIdempotency,
+  buildSaveIdempotencyStatement as buildStoredSaveIdempotencyStatement,
+} from './storage-idempotency-repo';
+import {
+  type PendingAttachmentCleanup,
+  recordPendingAttachmentCleanups as recordStoredPendingAttachmentCleanups,
+  getPendingAttachmentCleanups as listStoredPendingAttachmentCleanups,
+  deletePendingAttachmentCleanup as deleteStoredPendingAttachmentCleanup,
+  incrementPendingAttachmentCleanupRetry as incrementStoredPendingAttachmentCleanupRetry,
+  processPendingAttachmentCleanups as processStoredPendingAttachmentCleanups,
+} from './storage-attachment-cleanup-repo';
 import {
   bindRefreshTokenDeviceStamp as bindStoredRefreshTokenDeviceStamp,
   bindRefreshTokenSecurityStamp as bindStoredRefreshTokenSecurityStamp,
@@ -152,6 +171,7 @@ import {
   getRevisionMs as getStoredRevisionMs,
   updateRevisionDate as updateStoredRevisionDate,
   buildRevisionUpsertIfStatement as buildStoredRevisionUpsertIfStatement,
+  buildRevisionUpsertStatement as buildStoredRevisionUpsertStatement,
   buildRevisionSelectStatement as buildStoredRevisionSelectStatement,
 } from './storage-revision-repo';
 import {
@@ -177,8 +197,8 @@ const STORAGE_SCHEMA_VERSION_KEY = 'schema.version';
 // Bump this whenever src/services/storage-schema.ts or migrations/0001_init.sql
 // changes. Existing D1 installs only rerun ensureStorageSchema() when this value
 // differs from config.schema.version.
-const STORAGE_SCHEMA_VERSION = '2026-11-05-user-revision-ms';
-const REQUIRED_SCHEMA_TABLES = ['webauthn_credentials', 'webauthn_challenges', 'auth_requests', 'totp_login_replays'] as const;
+const STORAGE_SCHEMA_VERSION = '2026-11-09-idempotency-and-cleanup';
+const REQUIRED_SCHEMA_TABLES = ['webauthn_credentials', 'webauthn_challenges', 'auth_requests', 'totp_login_replays', 'request_idempotency', 'pending_attachment_cleanups'] as const;
 
 // D1-backed storage.
 // Contract:
@@ -192,6 +212,7 @@ export class StorageService {
   private static lastRefreshTokenCleanupAt = 0;
   private static lastAttachmentTokenCleanupAt = 0;
   private static lastTotpReplayCleanupAt = 0;
+  private static lastIdempotencyCleanupAt = 0;
   private static readonly MAX_D1_SQL_VARIABLES = 100;
   // Keep each cipher update batch comfortably below D1's per-batch statement
   // limits. Attachment rows beyond this size run in follow-up batches that use
@@ -200,6 +221,7 @@ export class StorageService {
 
   private static readonly REFRESH_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.refreshTokenCleanupIntervalMs;
   private static readonly ATTACHMENT_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.attachmentTokenCleanupIntervalMs;
+  private static readonly IDEMPOTENCY_CLEANUP_INTERVAL_MS = LIMITS.cleanup.idempotencyCleanupIntervalMs;
   private static readonly TOTP_REPLAY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
   private static readonly TOTP_REPLAY_MARKER_TTL_MS = 5 * 60 * 1000;
   private static readonly PERIODIC_CLEANUP_PROBABILITY = LIMITS.cleanup.cleanupProbability;
@@ -512,6 +534,34 @@ export class StorageService {
     await saveStoredCipher(this.db, this.safeBind.bind(this), cipher);
   }
 
+  buildSaveCipherStatement(cipher: Cipher): D1PreparedStatement {
+    return buildStoredCipherInsertStatement(this.db, this.safeBind.bind(this), cipher);
+  }
+
+  /**
+   * D1-304 / D1-305: atomically creates a cipher, advances the user revision monotonically,
+   * and optionally records the idempotency payload in a single transaction.
+   */
+  async createCipherWithRevisionAndIdempotency(
+    cipher: Cipher,
+    idempotencyRecord?: IdempotencyRecord
+  ): Promise<{ revisionDate: string }> {
+    const revisionMs = Date.now();
+    const statements: D1PreparedStatement[] = [
+      buildStoredCipherInsertStatement(this.db, this.safeBind.bind(this), cipher),
+      buildStoredRevisionUpsertStatement(this.db, cipher.userId, revisionMs),
+    ];
+    if (idempotencyRecord) {
+      statements.push(buildStoredSaveIdempotencyStatement(this.db, idempotencyRecord));
+    }
+    statements.push(buildStoredRevisionSelectStatement(this.db, cipher.userId));
+
+    const results = await this.db.batch(statements);
+    const revisionResultIndex = statements.length - 1;
+    const revisionRow = results[revisionResultIndex]?.results?.[0] as { revision_date?: string } | undefined;
+    return { revisionDate: revisionRow?.revision_date ?? new Date(revisionMs).toISOString() };
+  }
+
   async updateCipherIfUnchanged(cipher: Cipher, expectedUpdatedAt: string): Promise<boolean> {
     return updateStoredCipherIfUnchanged(this.db, this.safeBind.bind(this), cipher, expectedUpdatedAt);
   }
@@ -702,6 +752,34 @@ export class StorageService {
     await saveStoredFolder(this.db, folder);
   }
 
+  buildSaveFolderStatement(folder: Folder): D1PreparedStatement {
+    return buildStoredSaveFolderStatement(this.db, folder);
+  }
+
+  /**
+   * D1-304 / D1-305: atomically creates a folder, advances the user revision monotonically,
+   * and optionally records the idempotency payload in a single transaction.
+   */
+  async createFolderWithRevisionAndIdempotency(
+    folder: Folder,
+    idempotencyRecord?: IdempotencyRecord
+  ): Promise<{ revisionDate: string }> {
+    const revisionMs = Date.now();
+    const statements: D1PreparedStatement[] = [
+      buildStoredSaveFolderStatement(this.db, folder),
+      buildStoredRevisionUpsertStatement(this.db, folder.userId, revisionMs),
+    ];
+    if (idempotencyRecord) {
+      statements.push(buildStoredSaveIdempotencyStatement(this.db, idempotencyRecord));
+    }
+    statements.push(buildStoredRevisionSelectStatement(this.db, folder.userId));
+
+    const results = await this.db.batch(statements);
+    const revisionResultIndex = statements.length - 1;
+    const revisionRow = results[revisionResultIndex]?.results?.[0] as { revision_date?: string } | undefined;
+    return { revisionDate: revisionRow?.revision_date ?? new Date(revisionMs).toISOString() };
+  }
+
   /** D1-302: folder rename only lands when the version the handler read is current. */
   async updateFolderIfUnchanged(folder: Folder, expectedUpdatedAt: string): Promise<boolean> {
     return updateStoredFolderIfUnchanged(this.db, folder, expectedUpdatedAt);
@@ -879,6 +957,34 @@ export class StorageService {
 
   async saveSend(send: Send): Promise<void> {
     await saveStoredSend(this.db, this.safeBind.bind(this), send);
+  }
+
+  buildSaveSendStatement(send: Send): D1PreparedStatement {
+    return buildStoredSaveSendStatement(this.db, this.safeBind.bind(this), send);
+  }
+
+  /**
+   * D1-304 / D1-305: atomically creates a send, advances the user revision monotonically,
+   * and optionally records the idempotency payload in a single transaction.
+   */
+  async createSendWithRevisionAndIdempotency(
+    send: Send,
+    idempotencyRecord?: IdempotencyRecord
+  ): Promise<{ revisionDate: string }> {
+    const revisionMs = Date.now();
+    const statements: D1PreparedStatement[] = [
+      buildStoredSaveSendStatement(this.db, this.safeBind.bind(this), send),
+      buildStoredRevisionUpsertStatement(this.db, send.userId, revisionMs),
+    ];
+    if (idempotencyRecord) {
+      statements.push(buildStoredSaveIdempotencyStatement(this.db, idempotencyRecord));
+    }
+    statements.push(buildStoredRevisionSelectStatement(this.db, send.userId));
+
+    const results = await this.db.batch(statements);
+    const revisionResultIndex = statements.length - 1;
+    const revisionRow = results[revisionResultIndex]?.results?.[0] as { revision_date?: string } | undefined;
+    return { revisionDate: revisionRow?.revision_date ?? new Date(revisionMs).toISOString() };
   }
 
   /**
@@ -1158,5 +1264,55 @@ export class StorageService {
       StorageService.lastAttachmentTokenCleanupAt = result.cleanedUpAt;
     }
     return result.consumed;
+  }
+
+  // --- Idempotency (D1-305) ---
+
+  async getIdempotencyRecord(userId: string, idempotencyKey: string): Promise<IdempotencyRecord | null> {
+    if (this.shouldRunPeriodicCleanup(StorageService.lastIdempotencyCleanupAt, StorageService.IDEMPOTENCY_CLEANUP_INTERVAL_MS)) {
+      StorageService.lastIdempotencyCleanupAt = Date.now();
+      void pruneStoredExpiredIdempotency(this.db).catch((err) => {
+        console.error('Periodic idempotency cleanup error:', err);
+      });
+    }
+    return getStoredIdempotencyRecord(this.db, userId, idempotencyKey);
+  }
+
+  async saveIdempotencyRecord(record: IdempotencyRecord): Promise<void> {
+    return saveStoredIdempotencyRecord(this.db, record);
+  }
+
+  async deleteIdempotencyRecord(userId: string, idempotencyKey: string): Promise<void> {
+    return deleteStoredIdempotencyRecord(this.db, userId, idempotencyKey);
+  }
+
+  async pruneExpiredIdempotency(nowMs?: number): Promise<number> {
+    return pruneStoredExpiredIdempotency(this.db, nowMs);
+  }
+
+  // --- Pending attachment cleanups (D1-304) ---
+
+  async recordPendingAttachmentCleanups(
+    userId: string,
+    cipherId: string,
+    failedBlobs: { attachmentId: string; blobKey: string; error?: string }[]
+  ): Promise<void> {
+    return recordStoredPendingAttachmentCleanups(this.db, userId, cipherId, failedBlobs);
+  }
+
+  async getPendingAttachmentCleanups(limit?: number): Promise<PendingAttachmentCleanup[]> {
+    return listStoredPendingAttachmentCleanups(this.db, limit);
+  }
+
+  async deletePendingAttachmentCleanup(id: string): Promise<void> {
+    return deleteStoredPendingAttachmentCleanup(this.db, id);
+  }
+
+  async incrementPendingAttachmentCleanupRetry(id: string, lastError?: string): Promise<void> {
+    return incrementStoredPendingAttachmentCleanupRetry(this.db, id, lastError);
+  }
+
+  async processPendingAttachmentCleanups(env: Env, limit?: number): Promise<{ processed: number; succeeded: number; failed: number }> {
+    return processStoredPendingAttachmentCleanups(env, this.db, limit);
   }
 }

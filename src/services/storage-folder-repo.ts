@@ -1,4 +1,8 @@
 import type { Folder } from '../types';
+import {
+  buildRevisionSelectStatement,
+  buildRevisionUpsertStatement,
+} from './storage-revision-repo';
 
 function mapFolderRow(row: any): Folder {
   return {
@@ -28,14 +32,17 @@ export async function getFolderForUser(db: D1Database, id: string, userId: strin
   return mapFolderRow(row);
 }
 
-export async function saveFolder(db: D1Database, folder: Folder): Promise<void> {
-  await db
+export function buildSaveFolderStatement(db: D1Database, folder: Folder): D1PreparedStatement {
+  return db
     .prepare(
       'INSERT INTO folders(id, user_id, name, created_at, updated_at) VALUES(?, ?, ?, ?, ?) ' +
       'ON CONFLICT(id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at WHERE user_id=excluded.user_id'
     )
-    .bind(folder.id, folder.userId, folder.name, folder.createdAt, folder.updatedAt)
-    .run();
+    .bind(folder.id, folder.userId, folder.name, folder.createdAt, folder.updatedAt);
+}
+
+export async function saveFolder(db: D1Database, folder: Folder): Promise<void> {
+  await buildSaveFolderStatement(db, folder).run();
 }
 
 // D1-302: a rename only lands when the folder still carries the version the
@@ -141,9 +148,15 @@ export async function bulkDeleteFolders(
     );
   }
 
-  await db.batch(statements);
+  // D1-304: Include the user revision update in the same batch so that
+  // any failure during deletion rolls back everything atomically.
+  const revisionMs = Date.now();
+  statements.push(buildRevisionUpsertStatement(db, userId, revisionMs));
+  statements.push(buildRevisionSelectStatement(db, userId));
 
-  return updateRevisionDate(userId);
+  const results = await db.batch(statements);
+  const revisionRow = results[results.length - 1]?.results?.[0] as { revision_date?: string } | undefined;
+  return revisionRow?.revision_date ?? new Date(revisionMs).toISOString();
 }
 
 export async function getAllFolders(db: D1Database, userId: string): Promise<Folder[]> {

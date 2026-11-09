@@ -129,12 +129,23 @@ export default {
     void controller;
     await ensureDatabaseInitialized(env);
     if (dbInitError) {
-      console.error('Skipping scheduled backup because DB init failed:', dbInitError);
+      console.error('Skipping scheduled tasks because DB init failed:', dbInitError);
       return;
     }
-    ctx.waitUntil(runScheduledBackupIfDue(env).catch((error) => {
-      console.error('Scheduled backup failed:', error);
-    }));
+    const storage = new StorageService(env.DB);
+    ctx.waitUntil(
+      Promise.allSettled([
+        runScheduledBackupIfDue(env).catch((error) => {
+          console.error('Scheduled backup failed:', error);
+        }),
+        storage.processPendingAttachmentCleanups(env).catch((error) => {
+          console.error('Scheduled pending attachment cleanup failed:', error);
+        }),
+        storage.pruneExpiredIdempotency().catch((error) => {
+          console.error('Scheduled idempotency prune failed:', error);
+        }),
+      ])
+    );
   },
 };
 

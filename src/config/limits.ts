@@ -95,9 +95,20 @@ export const LIMITS = {
     // Minimum interval between used attachment token cleanup runs.
     // 已使用附件令牌表清理最小间隔。
     attachmentTokenCleanupIntervalMs: 10 * 60 * 1000,
+    // Minimum interval between idempotency records cleanup runs.
+    // 幂等记录表清理最小间隔。
+    idempotencyCleanupIntervalMs: 30 * 60 * 1000,
+    // Minimum interval between pending attachment cleanup retry runs.
+    // 待清理附件重试最小间隔。
+    attachmentCleanupRetryIntervalMs: 5 * 60 * 1000,
     // Probability to trigger cleanup during requests.
     // 请求过程中触发清理的概率。
     cleanupProbability: 0.05,
+  },
+  idempotency: {
+    // Default TTL for idempotency records in seconds (24 hours).
+    // 幂等记录默认过期时间（秒，24小时）。
+    ttlSeconds: 24 * 60 * 60,
   },
   attachment: {
     // Max attachment upload size in bytes.

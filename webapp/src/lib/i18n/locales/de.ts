@@ -687,6 +687,7 @@ const de: Record<string, string> = {
   "txt_item_created": "Eintrag erstellt",
   "txt_item_deleted": "Eintrag gelöscht",
   "txt_item_deleted_permanently": "Eintrag endgültig gelöscht",
+  "txt_item_deleted_attachment_cleanup_pending": "Eintrag gelöscht. Bereinigung der Anhänge wird in Kürze abgeschlossen.",
   "txt_item_history": "Eintragsverlauf",
   "txt_password_history": "Passwortverlauf",
   "txt_password_updated_value": "Passwort aktualisiert: {value}",

@@ -124,7 +124,11 @@ export async function getCipherForUser(db: D1Database, id: string, userId: strin
   return parseCipherRow(row);
 }
 
-export async function saveCipher(db: D1Database, safeBind: SafeBind, cipher: Cipher): Promise<void> {
+export function buildCipherInsertStatement(
+  db: D1Database,
+  safeBind: SafeBind,
+  cipher: Cipher
+): D1PreparedStatement {
   const folderId = normalizeOptionalId(cipher.folderId);
   const data = buildCipherData(cipher, folderId);
   const stmt = db.prepare(
@@ -134,7 +138,7 @@ export async function saveCipher(db: D1Database, safeBind: SafeBind, cipher: Cip
     'type=excluded.type, folder_id=excluded.folder_id, name=excluded.name, notes=excluded.notes, favorite=excluded.favorite, data=excluded.data, reprompt=excluded.reprompt, key=excluded.key, updated_at=excluded.updated_at, archived_at=excluded.archived_at, deleted_at=excluded.deleted_at ' +
     'WHERE user_id=excluded.user_id'
   );
-  await safeBind(
+  return safeBind(
     stmt,
     cipher.id,
     cipher.userId,
@@ -150,7 +154,11 @@ export async function saveCipher(db: D1Database, safeBind: SafeBind, cipher: Cip
     cipher.updatedAt,
     cipher.archivedAt ?? null,
     cipher.deletedAt
-  ).run();
+  );
+}
+
+export async function saveCipher(db: D1Database, safeBind: SafeBind, cipher: Cipher): Promise<void> {
+  await buildCipherInsertStatement(db, safeBind, cipher).run();
 }
 
 // A single conditional UPDATE prevents a competing save or deletion between

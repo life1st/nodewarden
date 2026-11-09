@@ -687,6 +687,7 @@ const it: Record<string, string> = {
   "txt_item_created": "Elemento creato",
   "txt_item_deleted": "Elemento eliminato",
   "txt_item_deleted_permanently": "Elemento eliminato definitivamente",
+  "txt_item_deleted_attachment_cleanup_pending": "Elemento eliminato. La pulizia degli allegati sarà completata a breve.",
   "txt_item_history": "Cronologia Elemento",
   "txt_password_history": "Cronologia Password",
   "txt_password_updated_value": "Password aggiornata: {value}",

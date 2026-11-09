@@ -40,7 +40,11 @@ function formatSendDate(value: string | null | undefined): string {
 }
 
 function buildDefaultDraft(): SendDraft {
+  const idempotencyKey = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : undefined;
   return {
+    idempotencyKey,
     type: 'text',
     name: '',
     notes: '',

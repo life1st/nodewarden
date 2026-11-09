@@ -82,7 +82,8 @@ export async function createSend(
   authedFetch: AuthedFetch,
   session: SessionState,
   draft: SendDraft,
-  onProgress?: (percent: number | null) => void
+  onProgress?: (percent: number | null) => void,
+  options?: { idempotencyKey?: string }
 ): Promise<Send> {
   if (!session.symEncKey || !session.symMacKey) throw new Error('Vault key unavailable');
   const userEnc = base64ToBytes(session.symEncKey);
@@ -98,6 +99,7 @@ export async function createSend(
   const maxAccessCount = parseMaxAccessCountRaw(draft.maxAccessCount);
   const password = String(draft.password || '');
   const passwordHash = password ? await hashSendPasswordB64(password, sendKeyMaterial) : null;
+  const idempotencyKey = draft.idempotencyKey || options?.idempotencyKey;
 
   if (draft.type === 'text') {
     const text = String(draft.text || '').trim();
@@ -123,7 +125,10 @@ export async function createSend(
 
     const resp = await authedFetch('/api/sends', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      },
       body: JSON.stringify(payload),
     });
     if (!resp.ok) throw await apiErrorFromResponse(resp, 'Create send failed');
@@ -140,7 +145,10 @@ export async function createSend(
 
   const fileResp = await authedFetch('/api/sends/file/v2', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+    },
     body: JSON.stringify({
       type: 1,
       name: nameCipher,

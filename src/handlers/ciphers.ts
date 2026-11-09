@@ -15,6 +15,8 @@ import {
 } from '../types';
 import { StorageService } from '../services/storage';
 import { isCipherWriteUnchanged, type BulkCipherMutationResult } from '../services/storage-cipher-repo';
+import { computeRequestHash, type IdempotencyRecord } from '../services/storage-idempotency-repo';
+import { LIMITS } from '../config/limits';
 import {
   notifyUserCipherCreate,
   notifyUserCipherDelete,
@@ -982,12 +984,32 @@ async function verifyFolderOwnership(storage: StorageService, folderId: string |
 // POST /api/ciphers
 export async function handleCreateCipher(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
+  const idempotencyKey = request.headers.get('idempotency-key')?.trim();
 
+  const rawBody = await request.text();
   let body: any;
   try {
-    body = await request.json();
+    body = JSON.parse(rawBody);
   } catch {
     return errorResponse('Invalid JSON', 400);
+  }
+
+  let requestHash: string | null = null;
+  if (idempotencyKey) {
+    requestHash = await computeRequestHash(rawBody);
+    const existing = await storage.getIdempotencyRecord(userId, idempotencyKey);
+    if (existing) {
+      if (existing.requestHash === requestHash) {
+        return new Response(existing.responseBody, {
+          status: existing.status,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Idempotent-Replay': 'true',
+          },
+        });
+      }
+      return errorResponse('Idempotency key already used with different request payload', 409);
+    }
   }
 
   // Handle nested cipher object (from some clients)
@@ -1048,16 +1070,51 @@ export async function handleCreateCipher(request: Request, env: Env, userId: str
     if (!folderOk) return errorResponse('Folder not found', 404);
   }
 
-  await storage.saveCipher(cipher);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  const responseOptions = cipherResponseOptionsForRequest(request);
+  const responseJson = JSON.stringify(cipherToResponse(cipher, [], responseOptions));
+
+  const idempotencyRecord: IdempotencyRecord | undefined = (idempotencyKey && requestHash)
+    ? {
+        userId,
+        idempotencyKey,
+        requestHash,
+        status: 200,
+        responseBody: responseJson,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + LIMITS.idempotency.ttlSeconds * 1000,
+      }
+    : undefined;
+
+  let revisionDate: string;
+  try {
+    const res = await storage.createCipherWithRevisionAndIdempotency(cipher, idempotencyRecord);
+    revisionDate = res.revisionDate;
+  } catch (err: unknown) {
+    if (idempotencyKey && requestHash) {
+      const raced = await storage.getIdempotencyRecord(userId, idempotencyKey);
+      if (raced) {
+        if (raced.requestHash === requestHash) {
+          return new Response(raced.responseBody, {
+            status: raced.status,
+            headers: {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Idempotent-Replay': 'true',
+            },
+          });
+        }
+        return errorResponse('Idempotency key already used with different request payload', 409);
+      }
+    }
+    throw err;
+  }
+
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyCipherCreateForRequest(request, env, cipher, revisionDate);
-  const responseOptions = cipherResponseOptionsForRequest(request);
 
-  return jsonResponse(
-    cipherToResponse(cipher, [], responseOptions),
-    200
-  );
+  return new Response(responseJson, {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  });
 }
 
 // PUT /api/ciphers/:id
@@ -1255,11 +1312,12 @@ export async function handleDeleteCipher(request: Request, env: Env, userId: str
 // version race therefore touches nothing, while a blob cleanup failure can only
 // leave unreferenced blobs behind - never a live cipher whose attachments are
 // already gone.
+// D1-304: captures any failed blob deletion and records it as a pending cleanup task.
 async function permanentlyDeleteCipher(
   env: Env,
   storage: StorageService,
   cipher: Cipher
-): Promise<{ deleted: boolean; revisionDate: string }> {
+): Promise<{ deleted: boolean; revisionDate: string; attachmentCleanupPending: boolean }> {
   const attachments = await storage.getAttachmentsByCipher(cipher.id);
   const result = await storage.deleteCipherWithRevisionIfUnchanged(
     cipher.id,
@@ -1267,10 +1325,15 @@ async function permanentlyDeleteCipher(
     cipher.updatedAt,
     new Date().toISOString()
   );
+  let attachmentCleanupPending = false;
   if (result.deleted) {
-    await deleteAttachmentBlobs(env, cipher.id, attachments);
+    const { failedBlobs } = await deleteAttachmentBlobs(env, cipher.id, attachments);
+    if (failedBlobs.length > 0) {
+      attachmentCleanupPending = true;
+      await storage.recordPendingAttachmentCleanups(cipher.userId, cipher.id, failedBlobs);
+    }
   }
-  return result;
+  return { ...result, attachmentCleanupPending };
 }
 
 // DELETE /api/ciphers/:id (compat mode)
@@ -1287,7 +1350,7 @@ export async function handleDeleteCipherCompat(request: Request, env: Env, userI
   }
 
   if (cipher.deletedAt) {
-    const { deleted, revisionDate } = await permanentlyDeleteCipher(env, storage, cipher);
+    const { deleted, revisionDate, attachmentCleanupPending } = await permanentlyDeleteCipher(env, storage, cipher);
     if (!deleted) {
       return cipherConflictResponse();
     }
@@ -1299,7 +1362,11 @@ export async function handleDeleteCipherCompat(request: Request, env: Env, userI
       folderId: cipher.folderId ?? null,
       compat: true,
     });
-    return new Response(null, { status: 204 });
+    const headers: Record<string, string> = {};
+    if (attachmentCleanupPending) {
+      headers['X-Attachment-Cleanup'] = 'pending';
+    }
+    return new Response(null, { status: 204, headers });
   }
 
   return handleDeleteCipher(request, env, userId, id);
@@ -1314,7 +1381,7 @@ export async function handlePermanentDeleteCipher(request: Request, env: Env, us
     return errorResponse('Cipher not found', 404);
   }
 
-  const { deleted, revisionDate } = await permanentlyDeleteCipher(env, storage, cipher);
+  const { deleted, revisionDate, attachmentCleanupPending } = await permanentlyDeleteCipher(env, storage, cipher);
   if (!deleted) {
     return cipherConflictResponse();
   }
@@ -1326,7 +1393,11 @@ export async function handlePermanentDeleteCipher(request: Request, env: Env, us
     folderId: cipher.folderId ?? null,
   });
 
-  return new Response(null, { status: 204 });
+  const headers: Record<string, string> = {};
+  if (attachmentCleanupPending) {
+    headers['X-Attachment-Cleanup'] = 'pending';
+  }
+  return new Response(null, { status: 204, headers });
 }
 
 // PUT /api/ciphers/:id/restore
@@ -1666,9 +1737,14 @@ export async function handleBulkPermanentDeleteCiphers(request: Request, env: En
 
   const attachmentsByCipher = await storage.getAttachmentsByCipherIds(ownedIds);
   const result = await storage.bulkDeleteCiphers(ownedIds, userId);
+  let attachmentCleanupPending = false;
   if (result.completedCount > 0) {
     for (const cipherId of ownedIds.slice(0, result.completedCount)) {
-      await deleteAttachmentBlobs(env, cipherId, attachmentsByCipher.get(cipherId) ?? []);
+      const { failedBlobs } = await deleteAttachmentBlobs(env, cipherId, attachmentsByCipher.get(cipherId) ?? []);
+      if (failedBlobs.length > 0) {
+        attachmentCleanupPending = true;
+        await storage.recordPendingAttachmentCleanups(userId, cipherId, failedBlobs);
+      }
     }
   }
   if (result.revisionDate) {
@@ -1685,5 +1761,9 @@ export async function handleBulkPermanentDeleteCiphers(request: Request, env: En
     });
   }
 
-  return new Response(null, { status: 204 });
+  const headers: Record<string, string> = {};
+  if (attachmentCleanupPending) {
+    headers['X-Attachment-Cleanup'] = 'pending';
+  }
+  return new Response(null, { status: 204, headers });
 }

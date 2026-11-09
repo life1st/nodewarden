@@ -61,7 +61,7 @@ interface VaultPageProps {
   onBulkMove: (ids: string[], folderId: string | null) => Promise<void>;
   onVerifyMasterPassword: (email: string, password: string) => Promise<void>;
   onNotify: (type: 'success' | 'error' | 'warning', text: string) => void;
-  onCreateFolder: (name: string) => Promise<void>;
+  onCreateFolder: (name: string, options?: { idempotencyKey?: string }) => Promise<void>;
   onRenameFolder: (folderId: string, name: string) => Promise<void>;
   onDeleteFolder: (folderId: string) => Promise<void>;
   onBulkDeleteFolders: (folderIds: string[]) => Promise<void>;
@@ -108,6 +108,7 @@ export default function VaultPage(props: VaultPageProps) {
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveFolderId, setMoveFolderId] = useState('__none__');
   const [createFolderOpen, setCreateFolderOpen] = useState(false);
+  const folderIdempotencyKeyRef = useRef<string | null>(null);
   const [newFolderName, setNewFolderName] = useState('');
   const [pendingRenameFolder, setPendingRenameFolder] = useState<Folder | null>(null);
   const [renameFolderName, setRenameFolderName] = useState('');
@@ -1036,8 +1037,16 @@ const folderName = useCallback((id: string | null | undefined): string => {
       return;
     }
     setFailedMutation(null);
+    if (!folderIdempotencyKeyRef.current) {
+      folderIdempotencyKeyRef.current = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : null;
+    }
     try {
-      await props.onCreateFolder(newFolderName);
+      await props.onCreateFolder(newFolderName, {
+        idempotencyKey: folderIdempotencyKeyRef.current || undefined,
+      });
+      folderIdempotencyKeyRef.current = null;
       setCreateFolderOpen(false);
       setNewFolderName('');
     } catch {
@@ -1517,6 +1526,7 @@ const folderName = useCallback((id: string | null | undefined): string => {
         onMoveFolderIdChange={setMoveFolderId}
         onConfirmCreateFolder={() => void confirmCreateFolder()}
         onCancelCreateFolder={() => {
+          folderIdempotencyKeyRef.current = null;
           setCreateFolderOpen(false);
           setNewFolderName('');
         }}

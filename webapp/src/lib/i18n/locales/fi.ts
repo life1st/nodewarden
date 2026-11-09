@@ -687,6 +687,7 @@ const fi: Record<string, string> = {
   "txt_item_created": "Nimike luotu",
   "txt_item_deleted": "Nimike poistettu",
   "txt_item_deleted_permanently": "Nimike poistettu pysyvästi",
+  "txt_item_deleted_attachment_cleanup_pending": "Nimike poistettu. Liitteiden siivous valmistuu pian.",
   "txt_item_history": "Nimikehistoria",
   "txt_password_history": "Salasanahistoria",
   "txt_password_updated_value": "Salasana päivitetty: {value}",

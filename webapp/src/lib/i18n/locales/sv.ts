@@ -687,6 +687,7 @@ const sv: Record<string, string> = {
   "txt_item_created": "Objekt skapat",
   "txt_item_deleted": "Objekt raderat",
   "txt_item_deleted_permanently": "Objekt permanent raderat",
+  "txt_item_deleted_attachment_cleanup_pending": "Objekt raderat. Rengöring av bilagor slutförs inom kort.",
   "txt_item_history": "Objekthistorik",
   "txt_password_history": "Lösenordshistorik",
   "txt_password_updated_value": "Lösenord uppdaterat: {value}",

@@ -96,7 +96,7 @@ export interface AppMainRoutesProps {
   onBulkUnarchiveVaultItems: (ids: string[]) => Promise<void>;
   onBulkMoveVaultItems: (ids: string[], folderId: string | null) => Promise<void>;
   onVerifyMasterPassword: (email: string, password: string) => Promise<void>;
-  onCreateFolder: (name: string) => Promise<void>;
+  onCreateFolder: (name: string, options?: { idempotencyKey?: string }) => Promise<void>;
   onRenameFolder: (folderId: string, name: string) => Promise<void>;
   onDeleteFolder: (folderId: string) => Promise<void>;
   onBulkDeleteFolders: (folderIds: string[]) => Promise<void>;

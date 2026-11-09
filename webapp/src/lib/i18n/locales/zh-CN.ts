@@ -690,6 +690,7 @@ const zhCN: Record<string, string> = {
   "txt_item_created": "项目已创建",
   "txt_item_deleted": "项目已删除",
   "txt_item_deleted_permanently": "项目已永久删除",
+  "txt_item_deleted_attachment_cleanup_pending": "项目已删除，附件清理稍后完成",
   "txt_item_history": "项目历史",
   "txt_password_history": "密码历史记录",
   "txt_password_updated_value": "密码更新于: {value}",

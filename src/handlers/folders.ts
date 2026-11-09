@@ -11,6 +11,8 @@ import { readActingDeviceIdentifier } from '../utils/device';
 import { generateUUID } from '../utils/uuid';
 import { parsePagination, encodeContinuationToken } from '../utils/pagination';
 import { auditRequestMetadata, writeAuditEvent } from '../services/audit-events';
+import { computeRequestHash, type IdempotencyRecord } from '../services/storage-idempotency-repo';
+import { LIMITS } from '../config/limits';
 
 function notifyVaultSyncForRequest(
   request: Request,
@@ -104,12 +106,32 @@ export async function handleGetFolder(request: Request, env: Env, userId: string
 // POST /api/folders
 export async function handleCreateFolder(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
+  const idempotencyKey = request.headers.get('idempotency-key')?.trim();
 
+  const rawBody = await request.text();
   let body: { name?: string };
   try {
-    body = await request.json();
+    body = JSON.parse(rawBody);
   } catch {
     return errorResponse('Invalid JSON', 400);
+  }
+
+  let requestHash: string | null = null;
+  if (idempotencyKey) {
+    requestHash = await computeRequestHash(rawBody);
+    const existing = await storage.getIdempotencyRecord(userId, idempotencyKey);
+    if (existing) {
+      if (existing.requestHash === requestHash) {
+        return new Response(existing.responseBody, {
+          status: existing.status,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Idempotent-Replay': 'true',
+          },
+        });
+      }
+      return errorResponse('Idempotency key already used with different request payload', 409);
+    }
   }
 
   if (!body.name) {
@@ -125,8 +147,43 @@ export async function handleCreateFolder(request: Request, env: Env, userId: str
     updatedAt: now,
   };
 
-  await storage.saveFolder(folder);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  const responseJson = JSON.stringify(folderToResponse(folder));
+
+  const idempotencyRecord: IdempotencyRecord | undefined = (idempotencyKey && requestHash)
+    ? {
+        userId,
+        idempotencyKey,
+        requestHash,
+        status: 200,
+        responseBody: responseJson,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + LIMITS.idempotency.ttlSeconds * 1000,
+      }
+    : undefined;
+
+  let revisionDate: string;
+  try {
+    const res = await storage.createFolderWithRevisionAndIdempotency(folder, idempotencyRecord);
+    revisionDate = res.revisionDate;
+  } catch (err: unknown) {
+    if (idempotencyKey && requestHash) {
+      const raced = await storage.getIdempotencyRecord(userId, idempotencyKey);
+      if (raced) {
+        if (raced.requestHash === requestHash) {
+          return new Response(raced.responseBody, {
+            status: raced.status,
+            headers: {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Idempotent-Replay': 'true',
+            },
+          });
+        }
+        return errorResponse('Idempotency key already used with different request payload', 409);
+      }
+    }
+    throw err;
+  }
+
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifyUserFolderCreate(env, {
     userId,
@@ -135,7 +192,10 @@ export async function handleCreateFolder(request: Request, env: Env, userId: str
     contextId: readActingDeviceIdentifier(request),
   });
 
-  return jsonResponse(folderToResponse(folder), 200);
+  return new Response(responseJson, {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  });
 }
 
 // PUT /api/folders/:id

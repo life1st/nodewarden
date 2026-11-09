@@ -562,7 +562,11 @@ export function buildCipherDuplicateSignatures(cipher: Cipher, mode: DuplicateDe
 }
 
 export function createEmptyDraft(type: number): VaultDraft {
+  const idempotencyKey = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : undefined;
   return {
+    idempotencyKey,
     type,
     favorite: false,
     name: '',
@@ -641,6 +645,7 @@ export function createEmptyDraft(type: number): VaultDraft {
 
 export function draftFromCipher(cipher: Cipher): VaultDraft {
   const draft = createEmptyDraft(Number(cipher.type || 1));
+  draft.idempotencyKey = undefined;
   draft.id = cipher.id;
   draft.revisionDate = cipher.revisionDate;
   draft.favorite = !!cipher.favorite;

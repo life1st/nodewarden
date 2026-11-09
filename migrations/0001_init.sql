@@ -298,3 +298,32 @@ CREATE TABLE IF NOT EXISTS used_attachment_download_tokens (
   jti TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+-- D1-305: Request idempotency storage
+CREATE TABLE IF NOT EXISTS request_idempotency (
+  user_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  response_body TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_request_idempotency_expires
+  ON request_idempotency(expires_at);
+
+-- D1-304: Pending attachment blob cleanups
+CREATE TABLE IF NOT EXISTS pending_attachment_cleanups (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  cipher_id TEXT NOT NULL,
+  attachment_id TEXT NOT NULL,
+  blob_key TEXT NOT NULL,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_attachment_cleanups_created
+  ON pending_attachment_cleanups(created_at);
+

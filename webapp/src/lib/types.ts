@@ -301,6 +301,7 @@ export interface Send {
 
 export interface SendDraft {
   id?: string;
+  idempotencyKey?: string;
   type: 'text' | 'file';
   name: string;
   notes: string;
@@ -326,6 +327,7 @@ export interface VaultDraftField {
 
 export interface VaultDraft {
   id?: string;
+  idempotencyKey?: string;
   revisionDate?: string;
   type: number;
   favorite: boolean;

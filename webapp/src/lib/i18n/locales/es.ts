@@ -687,6 +687,7 @@ const es: Record<string, string> = {
   "txt_item_created": "Elemento creado",
   "txt_item_deleted": "Elemento eliminado",
   "txt_item_deleted_permanently": "Elemento eliminado permanentemente",
+  "txt_item_deleted_attachment_cleanup_pending": "Elemento eliminado. La limpieza de archivos adjuntos finalizará en breve.",
   "txt_item_history": "Historial del elemento",
   "txt_password_history": "Historial de contraseñas",
   "txt_password_updated_value": "Contraseña actualizada: {value}",

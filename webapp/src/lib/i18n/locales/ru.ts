@@ -687,6 +687,7 @@ const ru: Record<string, string> = {
   "txt_item_created": "Объект создан",
   "txt_item_deleted": "Объект удален.",
   "txt_item_deleted_permanently": "Объект окончательно удален.",
+  "txt_item_deleted_attachment_cleanup_pending": "Объект удален. Очистка вложений завершится в ближайшее время.",
   "txt_item_history": "История предмета",
   "txt_password_history": "История паролей",
   "txt_password_updated_value": "Пароль обновлен: {value}",

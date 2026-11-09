@@ -740,6 +740,7 @@ const en: Record<string, string> = {
   "txt_item_created": "Item created",
   "txt_item_deleted": "Item deleted",
   "txt_item_deleted_permanently": "Item permanently deleted",
+  "txt_item_deleted_attachment_cleanup_pending": "Item deleted. Attachment cleanup will finish shortly.",
   "txt_item_history": "Item History",
   "txt_password_history": "Password History",
   "txt_password_updated_value": "Password updated: {value}",

@@ -34,6 +34,7 @@ import {
   validateDeletionDate,
 } from './sends-shared';
 import { auditRequestMetadata, writeAuditEvent } from '../services/audit-events';
+import { computeRequestHash, type IdempotencyRecord } from '../services/storage-idempotency-repo';
 
 const SEND_EMAIL_AUTH_UNSUPPORTED_MESSAGE = 'Send email verification is not supported by this server.';
 
@@ -153,12 +154,32 @@ export async function handleGetSend(request: Request, env: Env, userId: string, 
 
 export async function handleCreateSend(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
+  const idempotencyKey = request.headers.get('idempotency-key')?.trim();
 
+  const rawBody = await request.text();
   let body: unknown;
   try {
-    body = await request.json();
+    body = JSON.parse(rawBody);
   } catch {
     return errorResponse('Invalid JSON', 400);
+  }
+
+  let requestHash: string | null = null;
+  if (idempotencyKey) {
+    requestHash = await computeRequestHash(rawBody);
+    const existing = await storage.getIdempotencyRecord(userId, idempotencyKey);
+    if (existing) {
+      if (existing.requestHash === requestHash) {
+        return new Response(existing.responseBody, {
+          status: existing.status,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Idempotent-Replay': 'true',
+          },
+        });
+      }
+      return errorResponse('Idempotency key already used with different request payload', 409);
+    }
   }
 
   const typeRaw = getAliasedProp(body, ['type', 'Type']);
@@ -264,23 +285,81 @@ export async function handleCreateSend(request: Request, env: Env, userId: strin
     send.emails = null;
   }
 
-  await storage.saveSend(send);
-  const revisionDate = await storage.updateRevisionDate(userId);
+  const responseJson = JSON.stringify(sendToResponse(send));
+
+  const idempotencyRecord: IdempotencyRecord | undefined = (idempotencyKey && requestHash)
+    ? {
+        userId,
+        idempotencyKey,
+        requestHash,
+        status: 200,
+        responseBody: responseJson,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + LIMITS.idempotency.ttlSeconds * 1000,
+      }
+    : undefined;
+
+  let revisionDate: string;
+  try {
+    const res = await storage.createSendWithRevisionAndIdempotency(send, idempotencyRecord);
+    revisionDate = res.revisionDate;
+  } catch (err: unknown) {
+    if (idempotencyKey && requestHash) {
+      const raced = await storage.getIdempotencyRecord(userId, idempotencyKey);
+      if (raced) {
+        if (raced.requestHash === requestHash) {
+          return new Response(raced.responseBody, {
+            status: raced.status,
+            headers: {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Idempotent-Replay': 'true',
+            },
+          });
+        }
+        return errorResponse('Idempotency key already used with different request payload', 409);
+      }
+    }
+    throw err;
+  }
+
   notifyVaultSyncForRequest(request, env, userId, revisionDate);
   notifySendCreateForRequest(request, env, send.id, userId, revisionDate);
 
-  return jsonResponse(sendToResponse(send));
+  return new Response(responseJson, {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  });
 }
 
 export async function handleCreateFileSendV2(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
   const maxFileSize = getBlobStorageMaxBytes(env, LIMITS.send.maxFileSizeBytes);
+  const idempotencyKey = request.headers.get('idempotency-key')?.trim();
 
+  const rawBody = await request.text();
   let body: unknown;
   try {
-    body = await request.json();
+    body = JSON.parse(rawBody);
   } catch {
     return errorResponse('Invalid JSON', 400);
+  }
+
+  let requestHash: string | null = null;
+  if (idempotencyKey) {
+    requestHash = await computeRequestHash(rawBody);
+    const existing = await storage.getIdempotencyRecord(userId, idempotencyKey);
+    if (existing) {
+      if (existing.requestHash === requestHash) {
+        return new Response(existing.responseBody, {
+          status: existing.status,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Idempotent-Replay': 'true',
+          },
+        });
+      }
+      return errorResponse('Idempotency key already used with different request payload', 409);
+    }
   }
 
   const typeRaw = getAliasedProp(body, ['type', 'Type']);
@@ -394,21 +473,60 @@ export async function handleCreateFileSendV2(request: Request, env: Env, userId:
     send.emails = null;
   }
 
-  await storage.saveSend(send);
-  const revisionDate = await storage.updateRevisionDate(userId);
-  notifyVaultSyncForRequest(request, env, userId, revisionDate);
-  notifySendCreateForRequest(request, env, send.id, userId, revisionDate);
   const jwtSecret = getSafeJwtSecret(env);
   if (!jwtSecret) {
     return errorResponse('Server configuration error', 500);
   }
   const uploadToken = await createSendFileUploadToken(userId, send.id, fileId, jwtSecret);
 
-  return jsonResponse({
+  const responseJson = JSON.stringify({
     fileUploadType: 1,
     object: 'send-fileUpload',
     url: buildDirectUploadUrl(request, `/api/sends/${send.id}/file/${fileId}`, uploadToken),
     sendResponse: sendToResponse(send),
+  });
+
+  const idempotencyRecord: IdempotencyRecord | undefined = (idempotencyKey && requestHash)
+    ? {
+        userId,
+        idempotencyKey,
+        requestHash,
+        status: 200,
+        responseBody: responseJson,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + LIMITS.idempotency.ttlSeconds * 1000,
+      }
+    : undefined;
+
+  let revisionDate: string;
+  try {
+    const res = await storage.createSendWithRevisionAndIdempotency(send, idempotencyRecord);
+    revisionDate = res.revisionDate;
+  } catch (err: unknown) {
+    if (idempotencyKey && requestHash) {
+      const raced = await storage.getIdempotencyRecord(userId, idempotencyKey);
+      if (raced) {
+        if (raced.requestHash === requestHash) {
+          return new Response(raced.responseBody, {
+            status: raced.status,
+            headers: {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Idempotent-Replay': 'true',
+            },
+          });
+        }
+        return errorResponse('Idempotency key already used with different request payload', 409);
+      }
+    }
+    throw err;
+  }
+
+  notifyVaultSyncForRequest(request, env, userId, revisionDate);
+  notifySendCreateForRequest(request, env, send.id, userId, revisionDate);
+
+  return new Response(responseJson, {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
   });
 }
 

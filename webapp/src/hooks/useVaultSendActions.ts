@@ -673,10 +673,14 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         const previousCipher = { ...cipher };
         if (cipher.deletedDate || (cipher as { deletedAt?: string | null }).deletedAt) {
           try {
-            await permanentDeleteCipher(authedFetch, cipher.id);
+            const { attachmentCleanupPending } = await permanentDeleteCipher(authedFetch, cipher.id);
             patchCipherBatch([cipher.id], () => null);
             void refreshVaultRevisionStamp();
-            onNotify('success', t('txt_item_deleted_permanently'));
+            if (attachmentCleanupPending) {
+              onNotify('warning', t('txt_item_deleted_attachment_cleanup_pending'));
+            } else {
+              onNotify('success', t('txt_item_deleted_permanently'));
+            }
           } catch (error) {
             onNotify('error', error instanceof Error ? error.message : t('txt_permanent_delete_item_failed'));
             throw error;
@@ -815,7 +819,7 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         }
       },
 
-      async createFolder(name: string) {
+      async createFolder(name: string, options?: { idempotencyKey?: string }) {
         const folderName = name.trim();
         if (!folderName) {
           onNotify('error', t('txt_folder_name_is_required'));
@@ -829,7 +833,7 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         }
         try {
           if (!session) throw new Error(t('txt_vault_key_unavailable'));
-          const created = await createFolder(authedFetch, session, folderName);
+          const created = await createFolder(authedFetch, session, folderName, options);
           upsertEncryptedFolder(created);
           patchDecryptedFolders((prev) => [
             {
@@ -934,10 +938,14 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
           throw error;
         }
         try {
-          await bulkPermanentDeleteCiphers(authedFetch, ids);
+          const { attachmentCleanupPending } = await bulkPermanentDeleteCiphers(authedFetch, ids);
           patchCipherBatch(ids, () => null);
           void refreshVaultRevisionStamp();
-          onNotify('success', t('txt_deleted_selected_items_permanently'));
+          if (attachmentCleanupPending) {
+            onNotify('warning', t('txt_item_deleted_attachment_cleanup_pending'));
+          } else {
+            onNotify('success', t('txt_deleted_selected_items_permanently'));
+          }
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_bulk_permanent_delete_failed'));
           throw error;
@@ -1426,7 +1434,10 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       ...actions,
       createVaultItem: queuedWriteAction(
         VAULT_WRITE_KEY,
-        (draft: VaultDraft) => saveMeta(draft.id || NEW_CIPHER_WRITE_TARGET),
+        (draft: VaultDraft) => ({
+          ...saveMeta(draft.id || NEW_CIPHER_WRITE_TARGET),
+          dedupeKey: draft.idempotencyKey ? `cipher:create:${draft.idempotencyKey}` : undefined,
+        }),
         actions.createVaultItem
       ),
       updateVaultItem: queuedWriteAction(
@@ -1484,7 +1495,14 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         }),
         actions.bulkMoveVaultItems
       ),
-      createFolder: queuedWriteAction(VAULT_WRITE_KEY, { kind: 'folder' }, actions.createFolder),
+      createFolder: queuedWriteAction(
+        VAULT_WRITE_KEY,
+        (_name: string, options?: { idempotencyKey?: string }): WriteJobMeta => ({
+          kind: 'folder',
+          dedupeKey: options?.idempotencyKey ? `folder:create:${options.idempotencyKey}` : undefined,
+        }),
+        actions.createFolder
+      ),
       deleteFolder: queuedWriteAction(
         VAULT_WRITE_KEY,
         (folderId: string): WriteJobMeta => ({ kind: 'folder', folderId }),
@@ -1498,7 +1516,14 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       bulkDeleteFolders: queuedWriteAction(VAULT_WRITE_KEY, { kind: 'folder' }, actions.bulkDeleteFolders),
       importVault: queuedWriteAction(VAULT_WRITE_KEY, { kind: 'import' }, actions.importVault),
       importEncryptedRaw: queuedWriteAction(VAULT_WRITE_KEY, { kind: 'import' }, actions.importEncryptedRaw),
-      createSend: queuedWriteAction(SEND_WRITE_KEY, { kind: 'send' }, actions.createSend),
+      createSend: queuedWriteAction(
+        SEND_WRITE_KEY,
+        (draft: SendDraft): WriteJobMeta => ({
+          kind: 'send',
+          dedupeKey: draft.idempotencyKey ? `send:create:${draft.idempotencyKey}` : undefined,
+        }),
+        actions.createSend
+      ),
       updateSend: queuedWriteAction(SEND_WRITE_KEY, { kind: 'send' }, actions.updateSend),
       deleteSend: queuedWriteAction(SEND_WRITE_KEY, { kind: 'send' }, actions.deleteSend),
       bulkDeleteSends: queuedWriteAction(SEND_WRITE_KEY, { kind: 'send' }, actions.bulkDeleteSends),

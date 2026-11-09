@@ -484,7 +484,13 @@ export async function handleDeleteAttachment(
   }
 
   const path = getAttachmentObjectKey(cipherId, attachmentId);
-  await deleteBlobObject(env, path);
+  try {
+    await deleteBlobObject(env, path);
+  } catch (err: unknown) {
+    await storage.recordPendingAttachmentCleanups(userId, cipherId, [
+      { attachmentId, blobKey: path, error: err instanceof Error ? err.message : String(err) },
+    ]);
+  }
 
   // Delete attachment metadata
   await storage.deleteAttachmentForUser(attachmentId, userId);
@@ -518,18 +524,28 @@ export async function handleDeleteAttachment(
 /**
  * Removes only the R2 blobs of one cipher's attachments. D1-301 deletes the
  * attachment rows inside its own transaction, so blob cleanup runs afterwards:
- * a failure here can leave unreferenced blobs, never a cipher whose
- * attachments were already destroyed.
+ * D1-304 captures any failed blob deletion and records it as a pending cleanup task.
  */
 export async function deleteAttachmentBlobs(
   env: Env,
   cipherId: string,
   attachments: Attachment[]
-): Promise<void> {
-  if (!attachments.length) return;
+): Promise<{ failedBlobs: { attachmentId: string; blobKey: string; error?: string }[] }> {
+  const failedBlobs: { attachmentId: string; blobKey: string; error?: string }[] = [];
+  if (!attachments.length) return { failedBlobs };
   await runWithConcurrency(attachments, LIMITS.performance.attachmentDeleteConcurrency, async (attachment) => {
-    await deleteBlobObject(env, getAttachmentObjectKey(cipherId, attachment.id));
+    const key = getAttachmentObjectKey(cipherId, attachment.id);
+    try {
+      await deleteBlobObject(env, key);
+    } catch (err: unknown) {
+      failedBlobs.push({
+        attachmentId: attachment.id,
+        blobKey: key,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   });
+  return { failedBlobs };
 }
 
 export async function deleteAllAttachmentsForCiphers(

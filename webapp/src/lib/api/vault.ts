@@ -45,15 +45,20 @@ export async function getFolderById(authedFetch: AuthedFetch, folderId: string):
 export async function createFolder(
   authedFetch: AuthedFetch,
   session: SessionState,
-  name: string
+  name: string,
+  options?: { idempotencyKey?: string }
 ): Promise<Folder> {
   if (!session.symEncKey || !session.symMacKey) throw new Error('Vault key unavailable');
   const enc = base64ToBytes(session.symEncKey);
   const mac = base64ToBytes(session.symMacKey);
   const encryptedName = await encryptBw(new TextEncoder().encode(name), enc, mac);
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (options?.idempotencyKey) {
+    headers['Idempotency-Key'] = options.idempotencyKey;
+  }
   const resp = await authedFetch('/api/folders', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ name: encryptedName }),
   });
   if (!resp.ok) throw await apiErrorFromResponse(resp, 'Create folder failed');
@@ -1451,13 +1456,19 @@ export async function buildCipherImportPayload(session: SessionState, draft: Vau
 export async function createCipher(
   authedFetch: AuthedFetch,
   session: SessionState,
-  draft: VaultDraft
+  draft: VaultDraft,
+  options?: { idempotencyKey?: string }
 ): Promise<Cipher> {
   const payload = await buildCipherPayload(session, draft, null);
+  const idempotencyKey = draft.idempotencyKey || options?.idempotencyKey;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
 
   const resp = await authedFetch('/api/ciphers', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(payload),
   });
   if (!resp.ok) throw await apiErrorFromResponse(resp, 'Create item failed');
@@ -1500,11 +1511,16 @@ export async function deleteCipher(authedFetch: AuthedFetch, cipherId: string): 
   return (await parseJson<Cipher>(resp))!;
 }
 
-export async function permanentDeleteCipher(authedFetch: AuthedFetch, cipherId: string): Promise<void> {
+export async function permanentDeleteCipher(
+  authedFetch: AuthedFetch,
+  cipherId: string
+): Promise<{ attachmentCleanupPending?: boolean }> {
   const id = String(cipherId || '').trim();
   if (!id) throw new Error('Cipher id is required');
   const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(id)}/delete`, { method: 'DELETE' });
   if (!resp.ok) throw await apiErrorFromResponse(resp, 'Permanent delete item failed');
+  const attachmentCleanupPending = resp.headers.get('x-attachment-cleanup') === 'pending';
+  return { attachmentCleanupPending };
 }
 
 export async function archiveCipher(authedFetch: AuthedFetch, cipherId: string): Promise<Cipher> {
@@ -1547,8 +1563,12 @@ export async function bulkArchiveCiphers(authedFetch: AuthedFetch, ids: string[]
   }
 }
 
-export async function bulkPermanentDeleteCiphers(authedFetch: AuthedFetch, ids: string[]): Promise<void> {
+export async function bulkPermanentDeleteCiphers(
+  authedFetch: AuthedFetch,
+  ids: string[]
+): Promise<{ attachmentCleanupPending?: boolean }> {
   const uniqueIds = Array.from(new Set(ids.map((id) => String(id || '').trim()).filter(Boolean)));
+  let anyCleanupPending = false;
   for (const chunk of chunkArray(uniqueIds, BULK_API_CHUNK_SIZE)) {
     const resp = await authedFetch('/api/ciphers/delete-permanent', {
       method: 'POST',
@@ -1556,7 +1576,11 @@ export async function bulkPermanentDeleteCiphers(authedFetch: AuthedFetch, ids: 
       body: JSON.stringify({ ids: chunk }),
     });
     if (!resp.ok) throw await apiErrorFromResponse(resp, 'Bulk permanent delete failed');
+    if (resp.headers.get('x-attachment-cleanup') === 'pending') {
+      anyCleanupPending = true;
+    }
   }
+  return { attachmentCleanupPending: anyCleanupPending };
 }
 
 export async function bulkRestoreCiphers(authedFetch: AuthedFetch, ids: string[]): Promise<void> {

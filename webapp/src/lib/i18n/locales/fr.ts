@@ -687,6 +687,7 @@ const fr: Record<string, string> = {
   "txt_item_created": "Élément créé",
   "txt_item_deleted": "Élément supprimé",
   "txt_item_deleted_permanently": "Élément supprimé définitivement",
+  "txt_item_deleted_attachment_cleanup_pending": "Élément supprimé. Le nettoyage des pièces jointes se terminera sous peu.",
   "txt_item_history": "Historique de l'élément",
   "txt_password_history": "Historique des mots de passe",
   "txt_password_updated_value": "Mot de passe mis à jour : {value}",
