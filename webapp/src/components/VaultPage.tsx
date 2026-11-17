@@ -1255,7 +1255,10 @@ const folderName = useCallback((id: string | null | undefined): string => {
   }, [isEditing, isCreating, cancelEdit, isMobileLayout, isSavingCurrentDraft, props.onNotify]);
   const handleCloseMobileSidebar = useCallback(() => setMobileSidebarOpen(false), []);
   const handleOpenDeleteAllFolders = useCallback(() => setDeleteAllFoldersOpen(true), []);
-  const handleOpenCreateFolder = useCallback(() => setCreateFolderOpen(true), []);
+  const handleOpenCreateFolder = useCallback((parent?: Folder) => {
+    setNewFolderName(parent ? `${parent.decName || parent.name || parent.id}/` : '');
+    setCreateFolderOpen(true);
+  }, []);
   const handleOpenRenameFolder = useCallback((folder: Folder) => {
     setPendingRenameFolder(folder);
     setRenameFolderName(folder.decName || folder.name || '');
