@@ -17,13 +17,11 @@ import {
   LayoutGrid,
   Pencil,
   ShieldUser,
-  ShieldCheck,
   Star,
   StickyNote,
   Trash2,
   X,
 } from 'lucide-preact';
-import { Link } from 'wouter';
 import type { Folder } from '@/lib/types';
 import { t } from '@/lib/i18n';
 import { folderDisplayName, getFolderSortOptions, sortFolders, splitFolderLabel, type SidebarFilter, type VaultSortMode } from '@/components/vault/vault-page-helpers';
@@ -65,9 +63,6 @@ export default function VaultSidebar(props: VaultSidebarProps) {
         </div>
       )}
       <div className="sidebar-block">
-        <Link href="/security/password-health" className="tree-btn">
-          <ShieldCheck size={14} className="tree-icon" /> <span className="tree-label">{t('nav_password_security')}</span>
-        </Link>
         <button type="button" className={`tree-btn ${props.sidebarFilter.kind === 'all' ? 'active' : ''}`} onClick={() => props.onChangeFilter({ kind: 'all' })}>
           <LayoutGrid size={14} className="tree-icon" /> <span className="tree-label">{t('txt_all_items')}</span>
         </button>
